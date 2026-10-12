@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: telegram-attendance-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROUP_CHAT_ID
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: ATTENDANCE_START_HOUR
+        value: "6"
+      - key: ATTENDANCE_START_MINUTE
+        value: "0"
+      - key: ATTENDANCE_END_HOUR
+        value: "11"
+      - key: ATTENDANCE_END_MINUTE
+        value: "30"
