@@ -330,6 +330,7 @@ cron.schedule('0 21 * * *', async () => {
 // Command: /syncmembers (Cleans all members who left the group)
 // -------------------------------------------------------------
 bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
+  const userMsgId = ctx.message ? ctx.message.message_id : null;
   try {
     const waitMsg = await ctx.reply('⏳ Checking & syncing group members with Telegram...');
     const members = await db.getAllMembers();
@@ -356,6 +357,13 @@ bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
       `✅ <b>Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🧹 <code>${removedCount}</code> left members database se remove kar diye gaye hain. Ab attendance report bilkul accurate rahegi!`,
       { parse_mode: 'HTML' }
     );
+
+    // 10 second baad ye message aur user ka command dono auto-delete ho jayenge!
+    setTimeout(() => {
+      ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
+      if (userMsgId) ctx.telegram.deleteMessage(ctx.chat.id, userMsgId).catch(() => {});
+    }, 10000);
+
   } catch (err) {
     console.error('[SYNCMEMBERS ERROR]:', err);
     ctx.reply('⚠️ Error syncing members.').catch(() => {});
