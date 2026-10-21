@@ -134,6 +134,23 @@ bot.use(async (ctx, next) => {
 });
 
 // -------------------------------------------------------------
+// Auto-Remove Member when they leave or get removed from group
+// -------------------------------------------------------------
+bot.on('left_chat_member', async (ctx) => {
+  try {
+    const leftUser = ctx.message.left_chat_member;
+    if (leftUser) {
+      const userId = String(leftUser.id);
+      const name = leftUser.first_name || 'Member';
+      console.log(`[LEAVE EVENT] ${name} (${userId}) left the group. Cleaning from database...`);
+      await db.removeMember(userId);
+    }
+  } catch (err) {
+    console.error('[LEFT_CHAT_MEMBER ERROR]:', err);
+  }
+});
+
+// -------------------------------------------------------------
 // 1. Cron Job: 6:00 AM Daily Morning Announcement Message
 // -------------------------------------------------------------
 cron.schedule('0 6 * * *', async () => {
@@ -308,6 +325,42 @@ cron.schedule('0 21 * * *', async () => {
     console.error('[CRON ERROR] 9 PM:', err);
   }
 }, { timezone: 'Asia/Kolkata' });
+
+// -------------------------------------------------------------
+// Command: /syncmembers (Cleans all members who left the group)
+// -------------------------------------------------------------
+bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
+  try {
+    const waitMsg = await ctx.reply('⏳ Checking & syncing group members with Telegram...');
+    const members = await db.getAllMembers();
+    let removedCount = 0;
+
+    for (const m of members) {
+      try {
+        const chatMember = await ctx.telegram.getChatMember(GROUP_CHAT_ID, m.userId);
+        if (chatMember.status === 'left' || chatMember.status === 'kicked') {
+          await db.removeMember(m.userId);
+          removedCount++;
+        }
+      } catch (err) {
+        // Agar Telegram bole user nahi hai chat me
+        await db.removeMember(m.userId);
+        removedCount++;
+      }
+    }
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      waitMsg.message_id,
+      null,
+      `✅ <b>Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🧹 <code>${removedCount}</code> left members database se remove kar diye gaye hain. Ab attendance report bilkul accurate rahegi!`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (err) {
+    console.error('[SYNCMEMBERS ERROR]:', err);
+    ctx.reply('⚠️ Error syncing members.').catch(() => {});
+  }
+});
 
 // -------------------------------------------------------------
 // 3. Command: /export (Download Excel/CSV Report)
