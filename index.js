@@ -1,5 +1,7 @@
 require('dotenv').config();
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
 const { DateTime } = require('luxon');
 const cron = require('node-cron');
@@ -14,6 +16,31 @@ const START_MINUTE = parseInt(process.env.ATTENDANCE_START_MINUTE || '0');
 const END_HOUR = parseInt(process.env.ATTENDANCE_END_HOUR || '11');
 const END_MINUTE = parseInt(process.env.ATTENDANCE_END_MINUTE || '30');
 const TIMING_TEXT = '06:00 AM – 11:30 AM (IST)';
+
+// 🗄️ File to store active button message IDs (Server restart hone par bhi yaad rahega)
+const BUTTONS_STORE = path.join(__dirname, 'active_buttons.json');
+
+function getStoredMessageIds() {
+  try {
+    if (fs.existsSync(BUTTONS_STORE)) {
+      const data = JSON.parse(fs.readFileSync(BUTTONS_STORE, 'utf8'));
+      const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+      if (data.date === today && Array.isArray(data.ids)) {
+        return data.ids;
+      }
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveStoredMessageIds(ids) {
+  try {
+    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    fs.writeFileSync(BUTTONS_STORE, JSON.stringify({ date: today, ids }), 'utf8');
+  } catch (e) {}
+}
+
+let activeAttendanceMessageIds = getStoredMessageIds();
 
 function isAttendanceOpen(dt) {
   const currentMins = dt.hour * 60 + dt.minute;
@@ -112,10 +139,48 @@ bot.use(async (ctx, next) => {
 cron.schedule('0 6 * * *', async () => {
   try {
     const msg = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏɴꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
-    await bot.telegram.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
-    console.log('[CRON] 6:00 AM Announcement sent with buttons.');
+    const sentMsg = await bot.telegram.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
+    
+    // Save Message ID to delete at 11:30 AM
+    activeAttendanceMessageIds.push(sentMsg.message_id);
+    saveStoredMessageIds(activeAttendanceMessageIds);
+
+    console.log('[CRON] 6:00 AM Announcement sent with buttons. Message ID:', sentMsg.message_id);
   } catch (err) {
     console.error('[CRON ERROR] 6 AM:', err);
+  }
+}, { timezone: 'Asia/Kolkata' });
+
+// -------------------------------------------------------------
+// 1.5. Cron Job: 11:30 AM Attendance Closed - Auto-Delete Buttons
+// -------------------------------------------------------------
+cron.schedule('30 11 * * *', async () => {
+  try {
+    console.log('[CRON] 11:30 AM: Removing active attendance button messages...');
+    const idsToDelete = [...new Set([...activeAttendanceMessageIds, ...getStoredMessageIds()])];
+    
+    for (const msgId of idsToDelete) {
+      await bot.telegram.deleteMessage(GROUP_CHAT_ID, msgId).catch(() => {});
+    }
+
+    activeAttendanceMessageIds = [];
+    saveStoredMessageIds([]);
+
+    // Group me 1 minute ke liye notice bhejein
+    const closedMsg = await bot.telegram.sendMessage(
+      GROUP_CHAT_ID,
+      `⏰ <b>ATTENDANCE CLOSED!</b> 🔒\n━━━━━━━━━━━━━━━━━━━━━━\n11:30 AM ho chuke hain. Aaj ki attendance window close ho gayi hai.\nAb attendance record nahi hogi.`,
+      { parse_mode: 'HTML' }
+    );
+
+    // 1 minute (60 seconds) baad notice message ko bhi auto-delete kar dein
+    setTimeout(() => {
+      bot.telegram.deleteMessage(GROUP_CHAT_ID, closedMsg.message_id).catch(() => {});
+    }, 60000);
+
+    console.log('[CRON] 11:30 AM: Attendance closed notice sent & buttons deleted.');
+  } catch (err) {
+    console.error('[CRON ERROR] 11:30 AM:', err);
   }
 }, { timezone: 'Asia/Kolkata' });
 
@@ -340,8 +405,23 @@ bot.hears(/^\/mystatus(@\w+)?$/, async (ctx) => {
 // -------------------------------------------------------------
 bot.hears(/^\/(attendance|panel|menu)(@\w+)?$/i, async (ctx) => {
   try {
+    const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
+    if (!isAttendanceOpen(nowKolkata)) {
+      const closed = await ctx.reply(`❌ Attendance closed hai!\n⏰ Timing: ${TIMING_TEXT}`);
+      setTimeout(() => {
+        ctx.deleteMessage(closed.message_id).catch(() => {});
+        if (ctx.message && ctx.message.message_id) ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+      }, 10000);
+      return;
+    }
+
     const text = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏɴꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
-    await ctx.reply(text, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
+    const panelMsg = await ctx.reply(text, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
+    
+    // Track extra button panels so they get auto-deleted at 11:30 AM too
+    activeAttendanceMessageIds.push(panelMsg.message_id);
+    saveStoredMessageIds(activeAttendanceMessageIds);
+
     if (ctx.message && ctx.message.message_id) {
       setTimeout(() => {
         ctx.deleteMessage(ctx.message.message_id).catch(() => {});
