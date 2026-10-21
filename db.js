@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
+const { DateTime } = require('luxon');
 
 const DB_FILE = path.join(__dirname, 'attendance_db.json');
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -32,14 +33,10 @@ let isMongoConnected = false;
 
 if (MONGODB_URI && MONGODB_URI.trim() !== '') {
   mongoose.connect(MONGODB_URI.trim())
-    .then(async () => {
+    .then(() => {
       isMongoConnected = true;
       console.log('✅ [DATABASE] Connected to MongoDB Atlas Cloud successfully!');
-      try {
-        const doc = await getDoc();
-      } catch(e){}
     })
-
     .catch(err => {
       console.error('❌ [DATABASE ERROR] MongoDB Connection Failed:', err.message);
       console.warn('⚠️ [DATABASE] Falling back to local DB file.');
@@ -55,157 +52,151 @@ function loadDB() {
     return initial;
   }
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-  } catch (err) {
+    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch (e) {
     return { members: {}, attendance: [] };
   }
 }
 
 function saveDB(data) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('[LOCAL DB ERROR] Save failed:', e);
+  }
 }
 
-function addAttendanceLocal(record) {
-  const db = loadDB();
-  db.members[record.userId] = {
-    userId: String(record.userId),
-    name: record.name || 'Unknown',
-    username: record.username || '',
-    lastSeen: new Date().toISOString()
-  };
-
-  const userIdStr = String(record.userId);
-  const dateStr = String(record.date).trim();
-
-  const exists = db.attendance.find(a => String(a.userId) === userIdStr && String(a.date).trim() === dateStr);
-  if (exists) return false;
-
-  db.attendance.push({
-    date: dateStr,
-    userId: userIdStr,
-    name: record.name || 'Unknown',
-    username: record.username || '',
-    status: record.status || 'Present',
-    reason: record.reason || '',
-    timestamp: record.timestamp || new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-  });
-
-  saveDB(db);
-  return true;
-}
-
-// Exported Functions
+// Member Registration
 async function registerMember(userId, name, username) {
-  if (!userId) return;
-  const uIdStr = String(userId);
-
-  // Local sync
-  const dbLocal = loadDB();
-  dbLocal.members[uIdStr] = { userId: uIdStr, name: name || 'Unknown', username: username || '', lastSeen: new Date().toISOString() };
-  saveDB(dbLocal);
-
+  userId = String(userId);
   if (isMongoConnected) {
     try {
       await Member.findOneAndUpdate(
-        { userId: uIdStr },
-        { name: name || 'Unknown', username: username || '', lastSeen: new Date() },
+        { userId },
+        { userId, name: name || 'Unknown', username: username || '', lastSeen: new Date() },
         { upsert: true, new: true }
       );
-    } catch (e) {
-      console.error('[MONGO MEMBER ERR]:', e.message);
-    }
+    } catch (e) {}
+  } else {
+    const data = loadDB();
+    data.members[userId] = { userId, name: name || 'Unknown', username: username || '', lastSeen: new Date() };
+    saveDB(data);
   }
 }
 
-async function addAttendance(record) {
-  if (!record.userId) return false;
-  const uIdStr = String(record.userId);
-  const dateStr = String(record.date).trim();
-  const timestampStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  record.timestamp = timestampStr;
-
+// Remove Member (When they leave group)
+async function removeMember(userId) {
+  userId = String(userId);
   if (isMongoConnected) {
     try {
-      const existing = await Attendance.findOne({ userId: uIdStr, date: dateStr });
-      if (existing) return false;
-
-      await Attendance.create({
-        date: dateStr,
-        userId: uIdStr,
-        name: record.name || 'Unknown',
-        username: record.username || '',
-        status: record.status || 'Present',
-        reason: record.reason || '',
-        timestamp: timestampStr
-      });
-      // also keep local in sync
-      addAttendanceLocal(record);
-      return true;
-    } catch (err) {
-      if (err.code === 11000) return false; // Duplicate index
-      console.error('[MONGO ATTENDANCE ERR]:', err.message);
-    }
-  }
-
-  return addAttendanceLocal(record);
-}
-
-async function getAllAttendance() {
-  if (isMongoConnected) {
-    try {
-      const records = await Attendance.find().lean();
-      if (records && records.length > 0) return records;
+      await Member.deleteOne({ userId });
+      console.log(`[DATABASE] Member ${userId} removed from MongoDB.`);
     } catch (e) {
-      console.error('[MONGO GET ATTENDANCE ERR]:', e.message);
+      console.error('[DATABASE ERROR] Remove member failed:', e);
+    }
+  } else {
+    const data = loadDB();
+    if (data.members && data.members[userId]) {
+      delete data.members[userId];
+      saveDB(data);
+      console.log(`[DATABASE] Member ${userId} removed from Local DB.`);
     }
   }
-  const db = loadDB();
-  return db.attendance || [];
 }
 
+// Get All Members
 async function getAllMembers() {
   if (isMongoConnected) {
     try {
-      const members = await Member.find().lean();
-      if (members && members.length > 0) return members;
+      return await Member.find({});
     } catch (e) {
-      console.error('[MONGO GET MEMBERS ERR]:', e.message);
+      console.error('[DATABASE ERROR] getAllMembers failed:', e);
     }
   }
-  const db = loadDB();
-  return Object.values(db.members || {});
+  const data = loadDB();
+  return Object.values(data.members || {});
 }
 
+// Get All Attendance
+async function getAllAttendance() {
+  if (isMongoConnected) {
+    try {
+      return await Attendance.find({});
+    } catch (e) {
+      console.error('[DATABASE ERROR] getAllAttendance failed:', e);
+    }
+  }
+  const data = loadDB();
+  return data.attendance || [];
+}
+
+// Add Attendance Record
+async function addAttendance({ date, userId, name, username, status, reason }) {
+  userId = String(userId);
+  const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
+  const timestamp = nowKolkata.toFormat('dd/MM/yyyy, hh:mm:ss a');
+
+  if (isMongoConnected) {
+    try {
+      const existing = await Attendance.findOne({ date, userId });
+      if (existing) return false;
+
+      await Attendance.create({
+        date,
+        userId,
+        name: name || 'Unknown',
+        username: username || '',
+        status: status || 'Present',
+        reason: reason || '',
+        timestamp
+      });
+      return true;
+    } catch (e) {
+      if (e.code === 11000) return false;
+      console.error('[DATABASE ERROR] addAttendance:', e);
+      return false;
+    }
+  } else {
+    const data = loadDB();
+    const existing = data.attendance.find(r => String(r.date).trim() === date && String(r.userId) === userId);
+    if (existing) return false;
+
+    data.attendance.push({
+      date,
+      userId,
+      name: name || 'Unknown',
+      username: username || '',
+      status: status || 'Present',
+      reason: reason || '',
+      timestamp
+    });
+    saveDB(data);
+    return true;
+  }
+}
+
+// Generate CSV File for Export
 async function generateCSVFilePath() {
   const records = await getAllAttendance();
-  const headers = ['Date', 'User ID', 'Name', 'Username', 'Status', 'Reason', 'Time (IST)'];
-  const rows = [headers.join(',')];
+  const csvRows = ['Date,User ID,Name,Username,Status,Reason,Timestamp'];
 
-  const escapeCsv = (str) => `"${String(str || '').replace(/"/g, '""')}"`;
-
-  for (const row of records) {
-    const line = [
-      escapeCsv(row.date),
-      escapeCsv(row.userId),
-      escapeCsv(row.name),
-      escapeCsv(row.username),
-      escapeCsv(row.status),
-      escapeCsv(row.reason),
-      escapeCsv(row.timestamp)
-    ].join(',');
-    rows.push(line);
+  for (const r of records) {
+    const cleanName = String(r.name || '').replace(/,/g, ' ');
+    const cleanUsername = String(r.username || '').replace(/,/g, ' ');
+    const cleanReason = String(r.reason || '').replace(/,/g, ' ');
+    csvRows.push(`${r.date},${r.userId},"${cleanName}","${cleanUsername}",${r.status},"${cleanReason}","${r.timestamp}"`);
   }
 
-  const csvContent = rows.join('\n');
-  const filePath = path.join(__dirname, 'attendance_report.csv');
-  fs.writeFileSync(filePath, csvContent, 'utf-8');
-  return filePath;
+  const exportPath = path.join(__dirname, 'attendance_export.csv');
+  fs.writeFileSync(exportPath, csvRows.join('\n'), 'utf8');
+  return exportPath;
 }
 
 module.exports = {
   registerMember,
-  addAttendance,
-  getAllAttendance,
+  removeMember,
   getAllMembers,
+  getAllAttendance,
+  addAttendance,
   generateCSVFilePath
 };
