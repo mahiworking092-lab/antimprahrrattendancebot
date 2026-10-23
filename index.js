@@ -202,9 +202,9 @@ cron.schedule('30 11 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
-// 2. Cron Job: 9:00 PM Attractive Single-Card Summary Report + CSV
+// Function: Generate & Send Attractive Single-Card Night Report
 // -------------------------------------------------------------
-cron.schedule('0 21 * * *', async () => {
+async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
   try {
     const members = await db.getAllMembers();
     const attendance = await db.getAllAttendance();
@@ -272,7 +272,7 @@ cron.schedule('0 21 * * *', async () => {
       leaderboardText = '  <i>No streaks recorded today</i>';
     }
 
-    // Leave list (Clean short list)
+    // Leave list
     let leaveText = '';
     if (leaveUsers.length > 0) {
       leaveText = leaveUsers.slice(0, 5).map(u => `• <code>${escapeHTML(u.name || 'Unknown')}</code> <i>(${escapeHTML(u.reason || 'No reason')})</i>`).join('\n');
@@ -302,9 +302,9 @@ cron.schedule('0 21 * * *', async () => {
     // Build Attractive Single-Card Message
     const cardMsg = 
 `╭───────────────✦───────────────╮
-│ 📊 <b>ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
+│ 📊 <b>ᴅᴀɪʟY ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
 ╰───────────────✦───────────────╯
-📅 <b>Date:</b> <code>${displayDate}</code> • ⏰ <code>09:00 PM</code>
+📅 <b>Date:</b> <code>${displayDate}</code> • ⏰ <code>${nowKolkata.toFormat('hh:mm a')}</code>
 👥 <b>Total Members:</b> <code>${totalMembersCount}</code>
 
 📈 <b>Attendance Turnout:</b> <code>${turnoutRate}%</code>
@@ -332,22 +332,45 @@ ${warningText}
       [Markup.button.callback('🔍 Check My Status', 'btn_mystatus')]
     ]);
 
-    // Send the single compact report
-    await bot.telegram.sendMessage(GROUP_CHAT_ID, cardMsg, { parse_mode: 'HTML', ...reportKeyboard });
+    // Send the card message
+    await bot.telegram.sendMessage(targetChatId, cardMsg, { parse_mode: 'HTML', ...reportKeyboard });
 
-    // Auto-send Excel/CSV file report attached right after
+    // Send the CSV file right after
     const filePath = await db.generateCSVFilePath();
     await bot.telegram.sendDocument(
-      GROUP_CHAT_ID,
+      targetChatId,
       { source: filePath, filename: `attendance_${today}.csv` },
       { caption: `📁 <b>Detailed Attendance Excel/CSV Export (${today})</b>\nSabhi members ki poori list is file me hai.`, parse_mode: 'HTML' }
     );
 
-    console.log('[CRON] 9:00 PM Attractive Report & CSV sent successfully.');
+    console.log('[REPORT] Attractive Report & CSV sent successfully.');
   } catch (err) {
-    console.error('[CRON ERROR] 9 PM:', err);
+    console.error('[REPORT ERROR]:', err);
   }
+}
+
+// -------------------------------------------------------------
+// 2. Cron Job: 9:00 PM Daily Attendance Report Summary + CSV File
+// -------------------------------------------------------------
+cron.schedule('0 21 * * *', async () => {
+  await sendDailyAttendanceReport(GROUP_CHAT_ID);
 }, { timezone: 'Asia/Kolkata' });
+
+// -------------------------------------------------------------
+// Command: /testreport (Instantly Test & Preview Night Report)
+// -------------------------------------------------------------
+bot.hears(/^\/testreport(@\w+)?$/i, async (ctx) => {
+  try {
+    if (ctx.message && ctx.message.message_id) {
+      setTimeout(() => {
+        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+      }, 500);
+    }
+    await sendDailyAttendanceReport(ctx.chat.id);
+  } catch (err) {
+    console.error('[TESTREPORT ERROR]:', err);
+  }
+});
 
 // -------------------------------------------------------------
 // Command: /syncmembers (Cleans all members who left the group)
