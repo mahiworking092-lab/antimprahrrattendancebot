@@ -202,7 +202,7 @@ cron.schedule('30 11 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
-// Function: Generate & Send Attractive Single-Card Night Report
+// Function: Generate & Send Attractive Single-Card Night Report (No CSV file)
 // -------------------------------------------------------------
 async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
   try {
@@ -210,10 +210,10 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     const attendance = await db.getAllAttendance();
 
     const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
-    const today = nowKolkata.toFormat('dd-MM-yyyy');
     const displayDate = nowKolkata.toFormat('dd LLL yyyy');
     const yesterday = nowKolkata.minus({ days: 1 }).toFormat('dd-MM-yyyy');
     const dayBefore = nowKolkata.minus({ days: 2 }).toFormat('dd-MM-yyyy');
+    const today = nowKolkata.toFormat('dd-MM-yyyy');
 
     const totalMembersCount = members.length;
 
@@ -302,7 +302,7 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     // Build Attractive Single-Card Message
     const cardMsg = 
 `╭───────────────✦───────────────╮
-│ 📊 <b>ᴅᴀɪʟY ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
+│ 📊 <b>ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
 ╰───────────────✦───────────────╯
 📅 <b>Date:</b> <code>${displayDate}</code> • ⏰ <code>${nowKolkata.toFormat('hh:mm a')}</code>
 👥 <b>Total Members:</b> <code>${totalMembersCount}</code>
@@ -326,31 +326,24 @@ ${leaveText}
 ${warningText}
 
 ━━━━━━━━━━━━━━━━━━━━━━
-💡 <i>"${randomQuote}"</i>`;
+💡 <i>"${randomQuote}"</i>
+📁 <i>CSV file download karne ke liye type karein:</i> <code>/csv</code>`;
 
     const reportKeyboard = Markup.inlineKeyboard([
       [Markup.button.callback('🔍 Check My Status', 'btn_mystatus')]
     ]);
 
-    // Send the card message
+    // Send the single compact report (BINA kisi CSV file ke!)
     await bot.telegram.sendMessage(targetChatId, cardMsg, { parse_mode: 'HTML', ...reportKeyboard });
 
-    // Send the CSV file right after
-    const filePath = await db.generateCSVFilePath();
-    await bot.telegram.sendDocument(
-      targetChatId,
-      { source: filePath, filename: `attendance_${today}.csv` },
-      { caption: `📁 <b>Detailed Attendance Excel/CSV Export (${today})</b>\nSabhi members ki poori list is file me hai.`, parse_mode: 'HTML' }
-    );
-
-    console.log('[REPORT] Attractive Report & CSV sent successfully.');
+    console.log('[REPORT] Attractive Report sent successfully (No file attached).');
   } catch (err) {
     console.error('[REPORT ERROR]:', err);
   }
 }
 
 // -------------------------------------------------------------
-// 2. Cron Job: 9:00 PM Daily Attendance Report Summary + CSV File
+// 2. Cron Job: 9:00 PM Daily Attendance Report Summary
 // -------------------------------------------------------------
 cron.schedule('0 21 * * *', async () => {
   await sendDailyAttendanceReport(GROUP_CHAT_ID);
@@ -417,27 +410,29 @@ bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// 3. Command: /export (Download Excel/CSV Report)
+// 3. Command: /csv (or /cvc, /export) - Send CSV File On Demand
 // -------------------------------------------------------------
-bot.hears(/^\/export(@\w+)?$/i, async (ctx) => {
-  const userMessageId = ctx.message.message_id;
+bot.hears(/^\/(csv|cvc|export)(@\w+)?$/i, async (ctx) => {
+  const userMessageId = ctx.message ? ctx.message.message_id : null;
   try {
     const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
     const filePath = await db.generateCSVFilePath();
     const allAttendance = await db.getAllAttendance();
 
-    await ctx.replyWithDocument({ source: filePath, filename: `attendance_export_${today}.csv` }, {
-      caption: `📊 <b>Attendance Excel/CSV Export</b>\n📅 Generated on: <code>${today}</code>\nTotal Logs: <code>${allAttendance.length}</code>`,
+    await ctx.replyWithDocument({ source: filePath, filename: `attendance_${today}.csv` }, {
+      caption: `📁 <b>Attendance CSV File (${today})</b>\nTotal Records: <code>${allAttendance.length}</code>`,
       parse_mode: 'HTML'
     });
 
     // Delete user command after 500ms
-    setTimeout(() => {
-      ctx.deleteMessage(userMessageId).catch(() => {});
-    }, 500);
+    if (userMessageId) {
+      setTimeout(() => {
+        ctx.deleteMessage(userMessageId).catch(() => {});
+      }, 500);
+    }
   } catch (err) {
-    console.error('[COMMAND ERROR] /export:', err);
-    ctx.reply('⚠️ Failed to generate export file.').catch(() => {});
+    console.error('[COMMAND ERROR] /csv:', err);
+    ctx.reply('⚠️ Failed to generate CSV file.').catch(() => {});
   }
 });
 
