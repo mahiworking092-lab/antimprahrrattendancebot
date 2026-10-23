@@ -202,16 +202,18 @@ cron.schedule('30 11 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
-// 2. Cron Job: 9:00 PM Daily Attendance Report Summary + CSV File
+// 2. Cron Job: 9:00 PM Attractive Single-Card Summary Report + CSV
 // -------------------------------------------------------------
 cron.schedule('0 21 * * *', async () => {
   try {
     const members = await db.getAllMembers();
     const attendance = await db.getAllAttendance();
 
-    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
-    const yesterday = DateTime.now().setZone('Asia/Kolkata').minus({ days: 1 }).toFormat('dd-MM-yyyy');
-    const dayBefore = DateTime.now().setZone('Asia/Kolkata').minus({ days: 2 }).toFormat('dd-MM-yyyy');
+    const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
+    const today = nowKolkata.toFormat('dd-MM-yyyy');
+    const displayDate = nowKolkata.toFormat('dd LLL yyyy');
+    const yesterday = nowKolkata.minus({ days: 1 }).toFormat('dd-MM-yyyy');
+    const dayBefore = nowKolkata.minus({ days: 2 }).toFormat('dd-MM-yyyy');
 
     const totalMembersCount = members.length;
 
@@ -224,103 +226,124 @@ cron.schedule('0 21 * * *', async () => {
 
     const absentUsers = members.filter(m => !presentUserIds.has(String(m.userId)) && !leaveUserIds.has(String(m.userId)));
 
+    // Calculate Consecutive Inactive (3+ days)
     const warnings = [];
     for (const member of absentUsers) {
       const mId = String(member.userId);
       const attendedYesterday = attendance.some(r => String(r.date).trim() === yesterday && String(r.userId) === mId);
       const attendedDayBefore = attendance.some(r => String(r.date).trim() === dayBefore && String(r.userId) === mId);
       if (!attendedYesterday && !attendedDayBefore) {
-        warnings.push(member.name);
+        warnings.push(escapeHTML(member.name || 'Member'));
       }
     }
 
-    function chunkList(users, type) {
-      const chunks = [];
-      let currentChunk = [];
-      let currentLength = 0;
-      let counter = 1;
-      for (const user of users) {
-        let line = '';
-        const name = escapeHTML(user.name || 'Unknown');
-        if (type === 'leave') {
-          const reason = escapeHTML(user.reason || 'No reason specified');
-          line = `  <b>${counter}.</b> <code>${name}</code>\n     ┗ <i>${reason}</i>\n`;
-        } else {
-          line = `  <b>${counter}.</b> <code>${name}</code>\n`;
-        }
+    // Attendance Turnout Percentage & Visual Progress Bar
+    const turnoutRate = totalMembersCount > 0 ? Math.round((presentUsers.length / totalMembersCount) * 100) : 0;
+    const filledBlocks = Math.round((turnoutRate / 100) * 10);
+    const emptyBlocks = 10 - filledBlocks;
+    const progressBar = '▰'.repeat(filledBlocks) + '▱'.repeat(emptyBlocks);
 
-        if (currentLength + line.length > 3000) {
-          chunks.push(currentChunk.join(''));
-          currentChunk = [line];
-          currentLength = line.length;
+    // Calculate Streaks for Present Members to build Top 3 Leaderboard
+    const streakList = [];
+    for (const pUser of presentUsers) {
+      const uId = String(pUser.userId);
+      const uRows = attendance.filter(r => String(r.userId) === uId);
+      let sCount = 1;
+      let checkDate = nowKolkata.minus({ days: 1 });
+      while (true) {
+        const dStr = checkDate.toFormat('dd-MM-yyyy');
+        const pRec = uRows.find(r => String(r.date).trim() === dStr);
+        if (pRec && String(pRec.status || 'Present').trim() === 'Present') {
+          sCount++;
+          checkDate = checkDate.minus({ days: 1 });
         } else {
-          currentChunk.push(line);
-          currentLength += line.length;
+          break;
         }
-        counter++;
       }
-      if (currentChunk.length > 0) chunks.push(currentChunk.join(''));
-      return chunks;
+      streakList.push({ name: escapeHTML(pUser.name || 'Unknown'), streak: sCount });
     }
-
-    function chunkWarnings(warningList) {
-      const chunks = [];
-      let currentChunk = [];
-      let currentLength = 0;
-      let counter = 1;
-      for (const name of warningList) {
-        const line = `  <b>${counter}.</b> <code>${escapeHTML(name)}</code> ⚠️\n`;
-        if (currentLength + line.length > 3000) {
-          chunks.push(currentChunk.join(''));
-          currentChunk = [line];
-          currentLength = line.length;
-        } else {
-          currentChunk.push(line);
-          currentLength += line.length;
-        }
-        counter++;
-      }
-      if (currentChunk.length > 0) chunks.push(currentChunk.join(''));
-      return chunks;
-    }
-
-    const presentChunks = chunkList(presentUsers, 'present');
-    const leaveChunks = chunkList(leaveUsers, 'leave');
-    const absentChunks = chunkList(absentUsers, 'absent');
-    const warningChunks = chunkWarnings(warnings);
-
-    const divider = '━━━━━━━━━━━━━━━━━━━━━━\n';
-    let msg1 = `<b>📊 DAILY ATTENDANCE REPORT</b>\n${divider}📅 <b>Date:</b> <code>${today}</code>\n👥 <b>Total Members:</b> <code>${totalMembersCount}</code>\n${divider}✅ <b>Present Count:</b> <code>${presentUsers.length}</code>\n\n`;
-    if (presentChunks.length > 0) {
-      msg1 += `📝 <b>Present Members (Part 1):</b>\n${presentChunks[0]}`;
+    streakList.sort((a, b) => b.streak - a.streak);
+    const topThree = streakList.slice(0, 3);
+    const medals = ['🥇', '🥈', '🥉'];
+    let leaderboardText = '';
+    if (topThree.length > 0) {
+      leaderboardText = topThree.map((item, idx) => `${medals[idx]} <code>${item.name}</code> ➔ <b>${item.streak} Days</b> 🔥`).join('\n');
     } else {
-      msg1 += `📝 <b>Present Members:</b>\n  <i>None</i>`;
-    }
-    await bot.telegram.sendMessage(GROUP_CHAT_ID, msg1, { parse_mode: 'HTML' });
-
-    for (let i = 1; i < presentChunks.length; i++) {
-      await bot.telegram.sendMessage(GROUP_CHAT_ID, `📝 <b>Present Members (Part ${i + 1}):</b>\n${presentChunks[i]}`, { parse_mode: 'HTML' });
+      leaderboardText = '  <i>No streaks recorded today</i>';
     }
 
-    let leaveMsg = `🍂 <b>ON LEAVE COUNT: ${leaveUsers.length}</b>\n${divider}`;
-    if (leaveChunks.length > 0) leaveMsg += `📝 <b>Leave Registered:</b>\n${leaveChunks.join('')}`;
-    else leaveMsg += `📝 <b>Leave Registered:</b>\n  <i>None</i>`;
-    await bot.telegram.sendMessage(GROUP_CHAT_ID, leaveMsg, { parse_mode: 'HTML' });
+    // Leave list (Clean short list)
+    let leaveText = '';
+    if (leaveUsers.length > 0) {
+      leaveText = leaveUsers.slice(0, 5).map(u => `• <code>${escapeHTML(u.name || 'Unknown')}</code> <i>(${escapeHTML(u.reason || 'No reason')})</i>`).join('\n');
+      if (leaveUsers.length > 5) leaveText += `\n• <i>...and ${leaveUsers.length - 5} more on leave</i>`;
+    } else {
+      leaveText = '  <i>None</i>';
+    }
 
-    let absentMsg = `❌ <b>ABSENT COUNT: ${absentUsers.length}</b>\n${divider}`;
-    if (absentChunks.length > 0) absentMsg += `📝 <b>Absent Members:</b>\n${absentChunks.join('')}`;
-    else absentMsg += `📝 <b>Absent Members:</b>\n  <i>None</i>`;
-    absentMsg += '\n⚠️ <b>Consecutive Absentees (3+ days):</b>\n';
-    if (warningChunks.length > 0) absentMsg += warningChunks.join('');
-    else absentMsg += '  <i>None</i>';
+    // Warning text
+    let warningText = '';
+    if (warnings.length > 0) {
+      warningText = warnings.slice(0, 6).map(n => `<code>${n}</code> ⚠️`).join(', ');
+      if (warnings.length > 6) warningText += `, ...and ${warnings.length - 6} more`;
+    } else {
+      warningText = '  <i>Sabhi active hain! (None)</i>';
+    }
 
-    await bot.telegram.sendMessage(GROUP_CHAT_ID, absentMsg, { parse_mode: 'HTML' });
+    // Motivational quotes
+    const quotes = [
+      'सफलता एक दिन में नहीं मिलती, लेकिन एक दिन ज़रूर मिलती है।',
+      'निरंतर प्रयास ही सफलता की सबसे बड़ी कुंजी है।',
+      'जो पानी से नहाता है वो लिबास बदलता है, जो पसीने से नहाता है वो इतिहास बदलता है!',
+      'कल का दिन आपका होगा, अगर आज आपने पूरी लगन से मेहनत की होगी।'
+    ];
+    const randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
 
-    // Auto-send Excel/CSV file report
+    // Build Attractive Single-Card Message
+    const cardMsg = 
+`╭───────────────✦───────────────╮
+│ 📊 <b>ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
+╰───────────────✦───────────────╯
+📅 <b>Date:</b> <code>${displayDate}</code> • ⏰ <code>09:00 PM</code>
+👥 <b>Total Members:</b> <code>${totalMembersCount}</code>
+
+📈 <b>Attendance Turnout:</b> <code>${turnoutRate}%</code>
+<code>[${progressBar}]</code>
+
+┌──────────── <b>Overview</b> ────────────┐
+│ ✅ <b>Present:</b> <code>${presentUsers.length} Members</code>
+│ 🍂 <b>On Leave:</b> <code>${leaveUsers.length} Members</code>
+│ ❌ <b>Absent:</b> <code>${absentUsers.length} Members</code>
+└──────────────────────────────────┘
+
+🔥 <b>Top Consistent Champions:</b>
+${leaderboardText}
+
+🍂 <b>Approved Leaves:</b>
+${leaveText}
+
+⚠️ <b>3+ Days Inactive (Action Needed):</b>
+${warningText}
+
+━━━━━━━━━━━━━━━━━━━━━━
+💡 <i>"${randomQuote}"</i>`;
+
+    const reportKeyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🔍 Check My Status', 'btn_mystatus')]
+    ]);
+
+    // Send the single compact report
+    await bot.telegram.sendMessage(GROUP_CHAT_ID, cardMsg, { parse_mode: 'HTML', ...reportKeyboard });
+
+    // Auto-send Excel/CSV file report attached right after
     const filePath = await db.generateCSVFilePath();
-    await bot.telegram.sendDocument(GROUP_CHAT_ID, { source: filePath, filename: `attendance_${today}.csv` }, { caption: `📁 Daily Attendance Excel/CSV Export (${today})` });
+    await bot.telegram.sendDocument(
+      GROUP_CHAT_ID,
+      { source: filePath, filename: `attendance_${today}.csv` },
+      { caption: `📁 <b>Detailed Attendance Excel/CSV Export (${today})</b>\nSabhi members ki poori list is file me hai.`, parse_mode: 'HTML' }
+    );
 
-    console.log('[CRON] 9:00 PM Report & CSV sent successfully.');
+    console.log('[CRON] 9:00 PM Attractive Report & CSV sent successfully.');
   } catch (err) {
     console.error('[CRON ERROR] 9 PM:', err);
   }
