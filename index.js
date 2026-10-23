@@ -155,7 +155,7 @@ bot.on('left_chat_member', async (ctx) => {
 // -------------------------------------------------------------
 cron.schedule('0 6 * * *', async () => {
   try {
-    const msg = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏɴꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
+    const msg = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏNꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
     const sentMsg = await bot.telegram.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
     
     // Save Message ID to delete at 11:30 AM
@@ -299,7 +299,7 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     ];
     const randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
 
-    // Build Attractive Single-Card Message
+    // Build Attractive Single-Card Message (Clean finished at Quote)
     const cardMsg = 
 `╭───────────────✦───────────────╮
 │ 📊 <b>ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
@@ -326,17 +326,16 @@ ${leaveText}
 ${warningText}
 
 ━━━━━━━━━━━━━━━━━━━━━━
-💡 <i>"${randomQuote}"</i>
-📁 <i>CSV file download karne ke liye type karein:</i> <code>/csv</code>`;
+💡 <i>"${randomQuote}"</i>`;
 
     const reportKeyboard = Markup.inlineKeyboard([
       [Markup.button.callback('🔍 Check My Status', 'btn_mystatus')]
     ]);
 
-    // Send the single compact report (BINA kisi CSV file ke!)
+    // Send the single compact report
     await bot.telegram.sendMessage(targetChatId, cardMsg, { parse_mode: 'HTML', ...reportKeyboard });
 
-    console.log('[REPORT] Attractive Report sent successfully (No file attached).');
+    console.log('[REPORT] Attractive Report sent successfully.');
   } catch (err) {
     console.error('[REPORT ERROR]:', err);
   }
