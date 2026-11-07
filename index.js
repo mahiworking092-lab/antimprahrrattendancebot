@@ -17,7 +17,7 @@ const END_HOUR = parseInt(process.env.ATTENDANCE_END_HOUR || '11');
 const END_MINUTE = parseInt(process.env.ATTENDANCE_END_MINUTE || '30');
 const TIMING_TEXT = '06:00 AM – 11:30 AM (IST)';
 
-// 🗄️ File to store active button message IDs (Server restart hone par bhi yaad rahega)
+// 🗄️ File to store active button message IDs (11:30 AM auto-delete ke liye)
 const BUTTONS_STORE = path.join(__dirname, 'active_buttons.json');
 
 function getStoredMessageIds() {
@@ -42,7 +42,115 @@ function saveStoredMessageIds(ids) {
 
 let activeAttendanceMessageIds = getStoredMessageIds();
 
+// -------------------------------------------------------------
+// 📁 Admin & System Persistent State Files
+// -------------------------------------------------------------
+const STATE_FILE = path.join(__dirname, 'attendance_state.json');
+const MAINTENANCE_FILE = path.join(__dirname, 'maintenance_state.json');
+const HOLIDAY_FILE = path.join(__dirname, 'holiday_state.json');
+const ADMIN_FILE = path.join(__dirname, 'admin_state.json');
+
+function getAttendanceState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      if (typeof data.enabled === 'boolean') return data.enabled;
+    }
+  } catch (e) {}
+  return true; // Default ON
+}
+
+function setAttendanceState(enabled) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ enabled }), 'utf8');
+  } catch (e) {}
+}
+
+function getMaintenanceState() {
+  try {
+    if (fs.existsSync(MAINTENANCE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(MAINTENANCE_FILE, 'utf8'));
+      if (typeof data.enabled === 'boolean') return data.enabled;
+    }
+  } catch (e) {}
+  return false; // Default OFF
+}
+
+function setMaintenanceState(enabled) {
+  try {
+    fs.writeFileSync(MAINTENANCE_FILE, JSON.stringify({ enabled }), 'utf8');
+  } catch (e) {}
+}
+
+function getHolidayState() {
+  try {
+    if (fs.existsSync(HOLIDAY_FILE)) {
+      return JSON.parse(fs.readFileSync(HOLIDAY_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return { isHoliday: false, date: '', reason: '' };
+}
+
+function setHolidayState(isHoliday, reason = '') {
+  try {
+    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    fs.writeFileSync(HOLIDAY_FILE, JSON.stringify({ isHoliday, date: today, reason }), 'utf8');
+  } catch (e) {}
+}
+
+function isHolidayToday() {
+  const hol = getHolidayState();
+  if (!hol || !hol.isHoliday) return false;
+  const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+  return hol.date === today;
+}
+
+function getSavedAdminId() {
+  if (process.env.ADMIN_ID && process.env.ADMIN_ID.trim() !== '') {
+    return process.env.ADMIN_ID.trim();
+  }
+  try {
+    if (fs.existsSync(ADMIN_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ADMIN_FILE, 'utf8'));
+      if (data.adminId) return String(data.adminId).trim();
+    }
+  } catch (e) {}
+  return '';
+}
+
+function saveAdminId(adminId) {
+  try {
+    fs.writeFileSync(ADMIN_FILE, JSON.stringify({ adminId: String(adminId) }), 'utf8');
+  } catch (e) {}
+}
+
+// 🛡️ Admin Verification Helper
+async function checkIsAdmin(ctx) {
+  if (!ctx.from) return false;
+  const userId = String(ctx.from.id);
+  const savedAdmin = getSavedAdminId();
+
+  if (savedAdmin && userId === savedAdmin) return true;
+
+  try {
+    const member = await ctx.telegram.getChatMember(GROUP_CHAT_ID, userId);
+    if (member && ['creator', 'administrator'].includes(member.status)) {
+      if (!savedAdmin) saveAdminId(userId);
+      return true;
+    }
+  } catch (e) {}
+
+  return false;
+}
+
+const MAINTENANCE_POPUP = '⚠️ SERVER MAINTENANCE NOTICE\n\nAdmin Mahi is working on Data Server.\nPlease be patient, service will resume shortly!';
+const MAINTENANCE_CHAT_NOTICE = `<b>⚠️ SERVER MAINTENANCE NOTICE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👩‍💻 <b>Admin Mahi is currently working on Data Server.</b>\n⚙️ <i>Bot functions are temporarily paused to protect attendance records.\nServices will resume shortly. Thank you for your patience!</i> 🌸`;
+
 function isAttendanceOpen(dt) {
+  if (!getAttendanceState()) return false;
+  if (getMaintenanceState()) return false;
+  if (isHolidayToday()) return false;
+
   const currentMins = dt.hour * 60 + dt.minute;
   const startMins = START_HOUR * 60 + START_MINUTE;
   const endMins = END_HOUR * 60 + END_MINUTE;
@@ -67,30 +175,90 @@ function getAttendanceKeyboard() {
   ]);
 }
 
-// Pending Leave Requests in memory (userId -> { name, username, chatId, promptMsgId, timeout })
 const pendingLeaveRequests = new Map();
 
-// Auto-register members & intercept Leave Reason replies
+// -------------------------------------------------------------
+// 🎛️ Admin Dashboard Generator (Private Chat Only)
+// -------------------------------------------------------------
+function getAdminDashboardText() {
+  const attState = getAttendanceState() ? '🟢 ON (Active)' : '🔴 OFF (Closed)';
+  const maintState = getMaintenanceState() ? '🛠️ ACTIVE (Server Down Mode)' : '🚀 LIVE (Normal Mode)';
+  const hol = getHolidayState();
+  const holState = isHolidayToday() ? `🏖️ YES (${hol.reason || 'Rest Day'})` : '☀️ NO (Regular Day)';
+
+  return `👑 <b>MASTER ADMIN CONTROL PANEL</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `⚙️ <b>Live System Status:</b>\n` +
+    `• Attendance: <b>${attState}</b>\n` +
+    `• Holiday Today: <b>${holState}</b>\n` +
+    `• Maintenance: <b>${maintState}</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `<i>Niche diye gaye buttons se poora bot control karein:</i>`;
+}
+
+function getAdminKeyboard() {
+  const attState = getAttendanceState();
+  const maintState = getMaintenanceState();
+  const holState = isHolidayToday();
+
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(attState ? '🔴 Turn OFF Attendance' : '🟢 Turn ON Attendance', 'adm_toggle_att'),
+      Markup.button.callback(holState ? '☀️ Cancel Holiday' : '🏖️ Declare Holiday', 'adm_toggle_holiday')
+    ],
+    [
+      Markup.button.callback(maintState ? '🚀 Restore Server (UP)' : '🛠️ Server Down Mode', 'adm_toggle_maint')
+    ],
+    [
+      Markup.button.callback('📥 Download CSV Sheet', 'adm_export_csv'),
+      Markup.button.callback('🔄 Sync Group Members', 'adm_sync_members')
+    ],
+    [
+      Markup.button.callback('📊 Test Night Report', 'adm_test_report'),
+      Markup.button.callback('🔄 Refresh Status', 'adm_refresh')
+    ]
+  ]);
+}
+
+// -------------------------------------------------------------
+// Global Middleware: Register members & Intercept Maintenance
+// -------------------------------------------------------------
 bot.use(async (ctx, next) => {
   if (ctx.from) {
     db.registerMember(ctx.from.id, ctx.from.first_name, ctx.from.username).catch(() => {});
   }
 
-  // Check if this message is a response to a pending Leave request
+  // Intercept normal users during Maintenance Mode
+  if (getMaintenanceState() && ctx.from) {
+    const isAdmin = await checkIsAdmin(ctx);
+    if (!isAdmin) {
+      if (ctx.callbackQuery) {
+        return ctx.answerCbQuery(MAINTENANCE_POPUP, { show_alert: true });
+      }
+      if (ctx.message && ctx.message.text && /^\/(present|leave)/i.test(ctx.message.text)) {
+        const notice = await ctx.reply(MAINTENANCE_CHAT_NOTICE, { parse_mode: 'HTML' });
+        setTimeout(() => {
+          ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+          ctx.deleteMessage(notice.message_id).catch(() => {});
+        }, 12000);
+        return;
+      }
+    }
+  }
+
+  // Check if message is a response to a pending Leave request
   if (ctx.message && ctx.message.text && ctx.from) {
     const userId = String(ctx.from.id);
     if (pendingLeaveRequests.has(userId)) {
       const pending = pendingLeaveRequests.get(userId);
       const userText = ctx.message.text.trim();
 
-      // If user typed a command instead, let the command handler handle it
       if (!userText.startsWith('/')) {
         clearTimeout(pending.timeout);
         pendingLeaveRequests.delete(userId);
 
         const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
 
-        // Check reason validity (must be at least 3 characters)
         if (userText.length < 3) {
           const deniedMsg = await ctx.reply(
             `❌ <b>LEAVE DENIED (REJECTED):</b> ${escapeHTML(pending.name)}\n━━━━━━━━━━━━━━━━━━━━━━\n⚠️ Sahi reason na likhne ke karan aapki Leave reject kar di gayi hai.`,
@@ -105,7 +273,6 @@ bot.use(async (ctx, next) => {
           return;
         }
 
-        // Accept Leave with reason
         await db.addAttendance({
           date: today,
           userId: userId,
@@ -142,7 +309,7 @@ bot.on('left_chat_member', async (ctx) => {
     if (leftUser) {
       const userId = String(leftUser.id);
       const name = leftUser.first_name || 'Member';
-      console.log(`[LEAVE EVENT] ${name} (${userId}) left the group. Cleaning from database...`);
+      console.log(`[LEAVE EVENT] ${name} (${userId}) left group. Cleaning from database...`);
       await db.removeMember(userId);
     }
   } catch (err) {
@@ -155,6 +322,19 @@ bot.on('left_chat_member', async (ctx) => {
 // -------------------------------------------------------------
 cron.schedule('0 6 * * *', async () => {
   try {
+    if (isHolidayToday()) {
+      const hol = getHolidayState();
+      const holidayMsg = `🌸 <b>ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🏖️ <b>ᴛᴏᴅᴀʏ ɪꜱ ᴀ ʜᴏʟɪᴅᴀʏ!</b> 🎉\n📌 <b>Reason:</b> <i>${escapeHTML(hol.reason || 'Rest & Celebration Day')}</i>\n\n✨ Aaj attendance band rahegi. Sabhi log enjoy karein! 💗`;
+      await bot.telegram.sendMessage(GROUP_CHAT_ID, holidayMsg, { parse_mode: 'HTML' });
+      console.log('[CRON] 6:00 AM Holiday notice sent.');
+      return;
+    }
+
+    if (!getAttendanceState()) {
+      console.log('[CRON] 6:00 AM skipped: Attendance is turned OFF by Admin.');
+      return;
+    }
+
     const msg = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏNꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
     const sentMsg = await bot.telegram.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
     
@@ -183,14 +363,12 @@ cron.schedule('30 11 * * *', async () => {
     activeAttendanceMessageIds = [];
     saveStoredMessageIds([]);
 
-    // Group me 1 minute ke liye notice bhejein
     const closedMsg = await bot.telegram.sendMessage(
       GROUP_CHAT_ID,
       `⏰ <b>ATTENDANCE CLOSED!</b> 🔒\n━━━━━━━━━━━━━━━━━━━━━━\n11:30 AM ho chuke hain. Aaj ki attendance window close ho gayi hai.\nAb attendance record nahi hogi.`,
       { parse_mode: 'HTML' }
     );
 
-    // 1 minute (60 seconds) baad notice message ko bhi auto-delete kar dein
     setTimeout(() => {
       bot.telegram.deleteMessage(GROUP_CHAT_ID, closedMsg.message_id).catch(() => {});
     }, 60000);
@@ -202,10 +380,20 @@ cron.schedule('30 11 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
-// Function: Generate & Send Attractive Single-Card Night Report (No CSV file)
+// Function: Generate & Send Attractive Single-Card Night Report
 // -------------------------------------------------------------
 async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
   try {
+    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+
+    if (isHolidayToday()) {
+      const hol = getHolidayState();
+      const holMsg = `🏖️ <b>DAILY SUMMARY (HOLIDAY)</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📅 <b>Date:</b> <code>${today}</code>\n🎉 <b>Aaj Holiday thi:</b> <i>${escapeHTML(hol.reason || 'Rest Day')}</i>\n✨ <i>Kisi bhi member ka Absent mark nahi hua hai. Kal attendance normal shuru hogi!</i> 🌸`;
+      await bot.telegram.sendMessage(targetChatId, holMsg, { parse_mode: 'HTML' });
+      setHolidayState(false, ''); // Reset single day holiday
+      return;
+    }
+
     const members = await db.getAllMembers();
     const attendance = await db.getAllAttendance();
 
@@ -213,7 +401,6 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     const displayDate = nowKolkata.toFormat('dd LLL yyyy');
     const yesterday = nowKolkata.minus({ days: 1 }).toFormat('dd-MM-yyyy');
     const dayBefore = nowKolkata.minus({ days: 2 }).toFormat('dd-MM-yyyy');
-    const today = nowKolkata.toFormat('dd-MM-yyyy');
 
     const totalMembersCount = members.length;
 
@@ -299,7 +486,6 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     ];
     const randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
 
-    // Build Attractive Single-Card Message (Clean finished at Quote)
     const cardMsg = 
 `╭───────────────✦───────────────╮
 │ 📊 <b>ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ</b>
@@ -332,9 +518,7 @@ ${warningText}
       [Markup.button.callback('🔍 Check My Status', 'btn_mystatus')]
     ]);
 
-    // Send the single compact report
     await bot.telegram.sendMessage(targetChatId, cardMsg, { parse_mode: 'HTML', ...reportKeyboard });
-
     console.log('[REPORT] Attractive Report sent successfully.');
   } catch (err) {
     console.error('[REPORT ERROR]:', err);
@@ -349,25 +533,214 @@ cron.schedule('0 21 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
-// Command: /testreport (Instantly Test & Preview Night Report)
+// 👑 ADMIN COMMAND: /admin (Opens Interactive Dashboard in DM)
 // -------------------------------------------------------------
-bot.hears(/^\/testreport(@\w+)?$/i, async (ctx) => {
-  try {
-    if (ctx.message && ctx.message.message_id) {
-      setTimeout(() => {
-        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
-      }, 500);
-    }
-    await sendDailyAttendanceReport(ctx.chat.id);
-  } catch (err) {
-    console.error('[TESTREPORT ERROR]:', err);
+bot.hears(/^\/admin(@\w+)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') {
+    if (ctx.message) ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+    return;
   }
+
+  const isAdmin = await checkIsAdmin(ctx);
+  if (!isAdmin) {
+    return ctx.reply('⛔ <i>Access Denied. Yeh command sirf Admin ke liye reserved hai.</i>', { parse_mode: 'HTML' });
+  }
+
+  await ctx.reply(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
 });
 
 // -------------------------------------------------------------
-// Command: /syncmembers (Cleans all members who left the group)
+// 👑 ADMIN COMMAND: /setadmin (Claims or Sets Admin ID)
 // -------------------------------------------------------------
+bot.hears(/^\/setadmin(@\w+)?( .*)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+
+  const currentAdmin = getSavedAdminId();
+  const senderId = String(ctx.from.id);
+
+  try {
+    const member = await ctx.telegram.getChatMember(GROUP_CHAT_ID, senderId);
+    if (member && ['creator', 'administrator'].includes(member.status)) {
+      saveAdminId(senderId);
+      return ctx.reply(`👑 <b>Super Admin Locked Successfully!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Admin ID:</b> <code>${senderId}</code>\n\nAb aapke paas full master control hai. Type karein: <b>/admin</b>`, { parse_mode: 'HTML' });
+    }
+  } catch (e) {}
+
+  if (!currentAdmin) {
+    saveAdminId(senderId);
+    return ctx.reply(`👑 <b>Super Admin Set to your ID:</b> <code>${senderId}</code>\nType karein: <b>/admin</b>`, { parse_mode: 'HTML' });
+  }
+
+  return ctx.reply('⛔ Access Denied.');
+});
+
+// -------------------------------------------------------------
+// 👑 ADMIN DASHBOARD ACTIONS (Inline Buttons Handler)
+// -------------------------------------------------------------
+bot.action('adm_toggle_att', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const current = getAttendanceState();
+  setAttendanceState(!current);
+  const statusStr = !current ? '🟢 Attendance chalu (ON) kar di gayi!' : '🔴 Attendance band (OFF) kar di gayi!';
+  await ctx.answerCbQuery(statusStr, { show_alert: true });
+
+  try {
+    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+  } catch (e) {}
+});
+
+bot.action('adm_toggle_holiday', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const isHol = isHolidayToday();
+  if (isHol) {
+    setHolidayState(false, '');
+    await ctx.answerCbQuery('☀️ Holiday hatakar normal day kar diya gaya!', { show_alert: true });
+  } else {
+    setHolidayState(true, 'Official Holiday');
+    await ctx.answerCbQuery('🏖️ Aaj Holiday ghoshit kar di gayi! Absent mark nahi hoga.', { show_alert: true });
+  }
+
+  try {
+    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+  } catch (e) {}
+});
+
+bot.action('adm_toggle_maint', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const current = getMaintenanceState();
+  setMaintenanceState(!current);
+  const statusStr = !current ? '🛠️ Server Maintenance Mode ON!' : '🚀 Server Live (Normal Mode) restored!';
+  await ctx.answerCbQuery(statusStr, { show_alert: true });
+
+  try {
+    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+  } catch (e) {}
+});
+
+bot.action('adm_export_csv', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('⏳ CSV Sheet generate ho rahi hai...', { show_alert: false });
+  try {
+    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    const filePath = await db.generateCSVFilePath();
+    const allAttendance = await db.getAllAttendance();
+
+    await ctx.replyWithDocument({ source: filePath, filename: `attendance_${today}.csv` }, {
+      caption: `📁 <b>Admin Export (Excel/CSV)</b>\n📅 Generated on: <code>${today}</code>\nTotal Records: <code>${allAttendance.length}</code>`,
+      parse_mode: 'HTML'
+    });
+  } catch (err) {
+    console.error('[CSV EXPORT ERROR]:', err);
+    ctx.reply('⚠️ CSV export fail ho gaya.').catch(() => {});
+  }
+});
+
+bot.action('adm_sync_members', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('🔄 Group members sync ho rahe hain...', { show_alert: false });
+  try {
+    const members = await db.getAllMembers();
+    let removedCount = 0;
+
+    for (const m of members) {
+      try {
+        const chatMember = await ctx.telegram.getChatMember(GROUP_CHAT_ID, m.userId);
+        if (chatMember.status === 'left' || chatMember.status === 'kicked') {
+          await db.removeMember(m.userId);
+          removedCount++;
+        }
+      } catch (err) {
+        await db.removeMember(m.userId);
+        removedCount++;
+      }
+    }
+
+    await ctx.reply(`✅ <b>Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🧹 <code>${removedCount}</code> left members database se remove kar diye gaye hain.`, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('[SYNC ERROR]:', err);
+    ctx.reply('⚠️ Sync karte waqt error aaya.').catch(() => {});
+  }
+});
+
+bot.action('adm_test_report', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('📊 Sending test report to your DM...', { show_alert: false });
+  try {
+    await sendDailyAttendanceReport(ctx.chat.id);
+  } catch (err) {
+    ctx.reply('⚠️ Report generate karte waqt error aaya.').catch(() => {});
+  }
+});
+
+bot.action('adm_refresh', async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('🔄 Status updated!', { show_alert: false });
+  try {
+    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+  } catch (e) {}
+});
+
+// -------------------------------------------------------------
+// 👑 ADMIN DIRECT TEXT COMMANDS (Only for Admin)
+// -------------------------------------------------------------
+bot.hears(/^\/attendanceon(@\w+)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!(await checkIsAdmin(ctx))) return;
+  setAttendanceState(true);
+  await ctx.reply('🟢 <b>Attendance is now turned ON!</b>', { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/attendanceoff(@\w+)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!(await checkIsAdmin(ctx))) return;
+  setAttendanceState(false);
+  await ctx.reply('🔴 <b>Attendance is now turned OFF!</b>', { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/holiday(@\w+)?( .*)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!(await checkIsAdmin(ctx))) return;
+
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const reason = args || 'Official Holiday';
+  setHolidayState(true, reason);
+
+  await ctx.reply(`🏖️ <b>Holiday Declared for Today!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📌 <b>Reason:</b> <i>${escapeHTML(reason)}</i>\n✨ <i>Subah buttons nahi aayenge aur raat ko koi Absent mark nahi hoga.</i>`, { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/serverdown(@\w+)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!(await checkIsAdmin(ctx))) return;
+  setMaintenanceState(true);
+  await ctx.reply('🛠️ <b>Server Maintenance Mode Activated!</b>\nGroup members ko maintenance message dikhega.', { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/serverup(@\w+)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!(await checkIsAdmin(ctx))) return;
+  setMaintenanceState(false);
+  await ctx.reply('🚀 <b>Server Live! Normal Mode Restored.</b>', { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/testreport(@\w+)?$/i, async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return;
+  if (ctx.message && ctx.message.message_id) {
+    setTimeout(() => {
+      ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+    }, 500);
+  }
+  await sendDailyAttendanceReport(ctx.chat.id);
+});
+
 bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return;
   const userMsgId = ctx.message ? ctx.message.message_id : null;
   try {
     const waitMsg = await ctx.reply('⏳ Checking & syncing group members with Telegram...');
@@ -382,7 +755,6 @@ bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
           removedCount++;
         }
       } catch (err) {
-        // Agar Telegram bole user nahi hai chat me
         await db.removeMember(m.userId);
         removedCount++;
       }
@@ -396,7 +768,6 @@ bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
       { parse_mode: 'HTML' }
     );
 
-    // 10 second baad ye message aur user ka command dono auto-delete ho jayenge!
     setTimeout(() => {
       ctx.telegram.deleteMessage(ctx.chat.id, waitMsg.message_id).catch(() => {});
       if (userMsgId) ctx.telegram.deleteMessage(ctx.chat.id, userMsgId).catch(() => {});
@@ -408,10 +779,8 @@ bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
   }
 });
 
-// -------------------------------------------------------------
-// 3. Command: /csv (or /cvc, /export) - Send CSV File On Demand
-// -------------------------------------------------------------
 bot.hears(/^\/(csv|cvc|export)(@\w+)?$/i, async (ctx) => {
+  if (!(await checkIsAdmin(ctx))) return;
   const userMessageId = ctx.message ? ctx.message.message_id : null;
   try {
     const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
@@ -423,7 +792,6 @@ bot.hears(/^\/(csv|cvc|export)(@\w+)?$/i, async (ctx) => {
       parse_mode: 'HTML'
     });
 
-    // Delete user command after 500ms
     if (userMessageId) {
       setTimeout(() => {
         ctx.deleteMessage(userMessageId).catch(() => {});
@@ -436,7 +804,7 @@ bot.hears(/^\/(csv|cvc|export)(@\w+)?$/i, async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// 4. Command: /admission form
+// 3. Command: /admission form
 // -------------------------------------------------------------
 bot.hears(/^\/[Aa]dmission ?[Ff]orm$/, async (ctx) => {
   try {
@@ -448,7 +816,7 @@ bot.hears(/^\/[Aa]dmission ?[Ff]orm$/, async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// 5. Command: /mystatus
+// 4. Command: /mystatus
 // -------------------------------------------------------------
 bot.hears(/^\/mystatus(@\w+)?$/, async (ctx) => {
   const userId = String(ctx.from.id);
@@ -486,12 +854,10 @@ bot.hears(/^\/mystatus(@\w+)?$/, async (ctx) => {
 
     const statusMsg = await ctx.reply(text, { parse_mode: 'HTML' });
 
-    // Delete user command immediately
     setTimeout(() => {
       ctx.deleteMessage(userMessageId).catch(() => {});
     }, 500);
 
-    // Auto-delete status card after 60 seconds
     setTimeout(() => {
       ctx.deleteMessage(statusMsg.message_id).catch(() => {});
     }, 60000);
@@ -502,7 +868,7 @@ bot.hears(/^\/mystatus(@\w+)?$/, async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// 5.5 Command: /attendance (or /panel, /menu) - Opens Button Menu
+// 4.5 Command: /attendance (or /panel, /menu) - Opens Button Menu
 // -------------------------------------------------------------
 bot.hears(/^\/(attendance|panel|menu)(@\w+)?$/i, async (ctx) => {
   try {
@@ -516,10 +882,9 @@ bot.hears(/^\/(attendance|panel|menu)(@\w+)?$/i, async (ctx) => {
       return;
     }
 
-    const text = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏɴꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
+    const text = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏNꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
     const panelMsg = await ctx.reply(text, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
     
-    // Track extra button panels so they get auto-deleted at 11:30 AM too
     activeAttendanceMessageIds.push(panelMsg.message_id);
     saveStoredMessageIds(activeAttendanceMessageIds);
 
@@ -534,9 +899,22 @@ bot.hears(/^\/(attendance|panel|menu)(@\w+)?$/i, async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// Button Action: ✅ Mark Present
+// 5. Button Action: ✅ Mark Present
 // -------------------------------------------------------------
 bot.action('btn_present', async (ctx) => {
+  if (getMaintenanceState()) {
+    return ctx.answerCbQuery(MAINTENANCE_POPUP, { show_alert: true });
+  }
+
+  if (isHolidayToday()) {
+    const hol = getHolidayState();
+    return ctx.answerCbQuery(`🏖️ Aaj Holiday hai (${hol.reason || 'Chhutti'})!\nAttendance band hai.`, { show_alert: true });
+  }
+
+  if (!getAttendanceState()) {
+    return ctx.answerCbQuery('❌ Attendance abhi Admin dwara OFF kar di gayi hai.', { show_alert: true });
+  }
+
   const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
   const attendanceOpen = isAttendanceOpen(nowKolkata);
 
@@ -564,7 +942,6 @@ bot.action('btn_present', async (ctx) => {
       return ctx.answerCbQuery(`✅ ${name}, aapki attendance aaj pehle se lagi hui hai!`, { show_alert: true });
     }
 
-    // Calculate Streak
     const allRows = await db.getAllAttendance();
     let streakCount = 1;
     let checkDate = nowKolkata.minus({ days: 1 });
@@ -604,9 +981,21 @@ bot.action('btn_present', async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// Button Action: 🍂 Take Leave (Asks for Reason)
+// 6. Button Action: 🍂 Take Leave (Asks for Reason)
 // -------------------------------------------------------------
 bot.action('btn_leave', async (ctx) => {
+  if (getMaintenanceState()) {
+    return ctx.answerCbQuery(MAINTENANCE_POPUP, { show_alert: true });
+  }
+
+  if (isHolidayToday()) {
+    return ctx.answerCbQuery('🏖️ Aaj Holiday hai! Leave lagane ki zaroorat nahi.', { show_alert: true });
+  }
+
+  if (!getAttendanceState()) {
+    return ctx.answerCbQuery('❌ Attendance abhi Admin dwara OFF kar di gayi hai.', { show_alert: true });
+  }
+
   const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
   const attendanceOpen = isAttendanceOpen(nowKolkata);
 
@@ -648,7 +1037,6 @@ bot.action('btn_leave', async (ctx) => {
       }
     });
 
-    // 2-minute timer for timeout denial
     const timeout = setTimeout(async () => {
       if (pendingLeaveRequests.has(userId)) {
         pendingLeaveRequests.delete(userId);
@@ -665,7 +1053,7 @@ bot.action('btn_leave', async (ctx) => {
           }, 15000);
         } catch (e) {}
       }
-    }, 120000); // 120 seconds
+    }, 120000);
 
     pendingLeaveRequests.set(userId, {
       name,
@@ -746,12 +1134,42 @@ bot.action('btn_mystatus', async (ctx) => {
 });
 
 // -------------------------------------------------------------
-// 6. Attendance Handler: /present & /leave
+// 7. Attendance Handler: /present & /leave
 // -------------------------------------------------------------
 bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
   if (ctx.chat.type === 'private') return;
 
   const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
+  const userMessageId = ctx.message.message_id;
+
+  if (getMaintenanceState()) {
+    const notice = await ctx.reply(MAINTENANCE_CHAT_NOTICE, { parse_mode: 'HTML' });
+    setTimeout(() => {
+      ctx.deleteMessage(userMessageId).catch(() => {});
+      ctx.deleteMessage(notice.message_id).catch(() => {});
+    }, 12000);
+    return;
+  }
+
+  if (isHolidayToday()) {
+    const hol = getHolidayState();
+    const notice = await ctx.reply(`🏖️ <b>Aaj Holiday hai (${escapeHTML(hol.reason || 'Chhutti')})!</b>\nAttendance band hai.`, { parse_mode: 'HTML' });
+    setTimeout(() => {
+      ctx.deleteMessage(userMessageId).catch(() => {});
+      ctx.deleteMessage(notice.message_id).catch(() => {});
+    }, 10000);
+    return;
+  }
+
+  if (!getAttendanceState()) {
+    const notice = await ctx.reply('❌ <b>Attendance abhi Admin dwara band (OFF) hai.</b>', { parse_mode: 'HTML' });
+    setTimeout(() => {
+      ctx.deleteMessage(userMessageId).catch(() => {});
+      ctx.deleteMessage(notice.message_id).catch(() => {});
+    }, 10000);
+    return;
+  }
+
   const attendanceOpen = isAttendanceOpen(nowKolkata);
 
   const userId = String(ctx.from.id);
@@ -763,9 +1181,6 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
   const reason = !isPresent ? (userText.split(' ').slice(1).join(' ') || 'No reason specified') : '';
   const today = nowKolkata.toFormat('dd-MM-yyyy');
 
-  const userMessageId = ctx.message.message_id;
-
-  // CLOSED TIMING HANDLER
   if (!attendanceOpen) {
     const closedMsgText = `❌ Attendance/Leave is closed for today.\n\n⏰ Attendance timing: ${TIMING_TEXT}\n\nPlease try again tomorrow morning.`;
     const closedMsg = await ctx.reply(closedMsgText);
@@ -773,11 +1188,10 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
     setTimeout(() => {
       ctx.deleteMessage(closedMsg.message_id).catch(() => {});
       ctx.deleteMessage(userMessageId).catch(() => {});
-    }, 15000); // 15 seconds auto-delete
+    }, 15000);
     return;
   }
 
-  // OPEN TIMING HANDLER
   try {
     const success = await db.addAttendance({
       date: today,
@@ -789,7 +1203,6 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
     });
 
     if (!success) {
-      // Already Marked Handler
       const duplicateMsg = await ctx.reply(`<b>✅ ${name}, attendance/leave already marked for today</b>`, { parse_mode: 'HTML' });
 
       setTimeout(() => {
@@ -798,11 +1211,10 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
 
       setTimeout(() => {
         ctx.deleteMessage(duplicateMsg.message_id).catch(() => {});
-      }, 10000); // Delete duplicate notice after 10s
+      }, 10000);
       return;
     }
 
-    // Calculate Streak
     let streakCount = 0;
     if (isPresent) {
       const allRows = await db.getAllAttendance();
@@ -835,12 +1247,10 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
 
     const successMsg = await ctx.reply(replyText, { parse_mode: 'HTML' });
 
-    // Delete user command immediately
     setTimeout(() => {
       ctx.deleteMessage(userMessageId).catch(() => {});
     }, 500);
 
-    // Delete success message after 30 seconds
     setTimeout(() => {
       ctx.deleteMessage(successMsg.message_id).catch(() => {});
     }, 30000);
@@ -851,8 +1261,20 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
   }
 });
 
-bot.launch().then(() => {
-  console.log('🚀 Telegram Attendance Bot (MongoDB Cloud + Local DB + CSV Mode) is running...');
+// -------------------------------------------------------------
+// 8. Bot Initialization & Public Clean Menu Scoping
+// -------------------------------------------------------------
+bot.launch().then(async () => {
+  console.log('🚀 Telegram Attendance Bot (VIP Admin Shield + MongoDB + Clean Menu) is running...');
+
+  try {
+    await bot.telegram.setMyCommands([
+      { command: 'mystatus', description: '📊 Apni Attendance Summary dekhein' },
+      { command: 'admission', description: '📄 Admission Form Link' }
+    ]);
+  } catch (e) {
+    console.error('Menu command setting error:', e);
+  }
 });
 
 // 🌐 Lightweight HTTP Server for Render Health Check & Port Binding
