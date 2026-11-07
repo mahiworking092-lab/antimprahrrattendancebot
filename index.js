@@ -10,6 +10,14 @@ const db = require('./db');
 const BOT_TOKEN = process.env.BOT_TOKEN || '8974478810:AAEgxD-ikJrMwV_JSBJY9F45ppBhefoZjtg';
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003493006883';
 
+// 👑 EXCLUSIVE SUPER ADMIN TELEGRAM ID (Permanently Locked to Mahi)
+const ADMIN_ID = process.env.ADMIN_ID || '6416451659';
+
+function checkIsAdmin(ctx) {
+  if (!ctx.from) return false;
+  return String(ctx.from.id) === String(ADMIN_ID);
+}
+
 // ⏰ ATTENDANCE TIME WINDOW (IST): 06:00 AM – 11:30 AM
 const START_HOUR = parseInt(process.env.ATTENDANCE_START_HOUR || '6');
 const START_MINUTE = parseInt(process.env.ATTENDANCE_START_MINUTE || '0');
@@ -48,7 +56,6 @@ let activeAttendanceMessageIds = getStoredMessageIds();
 const STATE_FILE = path.join(__dirname, 'attendance_state.json');
 const MAINTENANCE_FILE = path.join(__dirname, 'maintenance_state.json');
 const HOLIDAY_FILE = path.join(__dirname, 'holiday_state.json');
-const ADMIN_FILE = path.join(__dirname, 'admin_state.json');
 
 function getAttendanceState() {
   try {
@@ -105,44 +112,6 @@ function isHolidayToday() {
   return hol.date === today;
 }
 
-function getSavedAdminId() {
-  if (process.env.ADMIN_ID && process.env.ADMIN_ID.trim() !== '') {
-    return process.env.ADMIN_ID.trim();
-  }
-  try {
-    if (fs.existsSync(ADMIN_FILE)) {
-      const data = JSON.parse(fs.readFileSync(ADMIN_FILE, 'utf8'));
-      if (data.adminId) return String(data.adminId).trim();
-    }
-  } catch (e) {}
-  return '';
-}
-
-function saveAdminId(adminId) {
-  try {
-    fs.writeFileSync(ADMIN_FILE, JSON.stringify({ adminId: String(adminId) }), 'utf8');
-  } catch (e) {}
-}
-
-// 🛡️ Admin Verification Helper
-async function checkIsAdmin(ctx) {
-  if (!ctx.from) return false;
-  const userId = String(ctx.from.id);
-  const savedAdmin = getSavedAdminId();
-
-  if (savedAdmin && userId === savedAdmin) return true;
-
-  try {
-    const member = await ctx.telegram.getChatMember(GROUP_CHAT_ID, userId);
-    if (member && ['creator', 'administrator'].includes(member.status)) {
-      if (!savedAdmin) saveAdminId(userId);
-      return true;
-    }
-  } catch (e) {}
-
-  return false;
-}
-
 const MAINTENANCE_POPUP = '⚠️ SERVER MAINTENANCE NOTICE\n\nAdmin Mahi is working on Data Server.\nPlease be patient, service will resume shortly!';
 const MAINTENANCE_CHAT_NOTICE = `<b>⚠️ SERVER MAINTENANCE NOTICE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👩‍💻 <b>Admin Mahi is currently working on Data Server.</b>\n⚙️ <i>Bot functions are temporarily paused to protect attendance records.\nServices will resume shortly. Thank you for your patience!</i> 🌸`;
 
@@ -188,6 +157,7 @@ function getAdminDashboardText() {
 
   return `👑 <b>MASTER ADMIN CONTROL PANEL</b>\n` +
     `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `👤 <b>Admin:</b> Mahi (<code>${ADMIN_ID}</code>)\n` +
     `⚙️ <b>Live System Status:</b>\n` +
     `• Attendance: <b>${attState}</b>\n` +
     `• Holiday Today: <b>${holState}</b>\n` +
@@ -230,7 +200,7 @@ bot.use(async (ctx, next) => {
 
   // Intercept normal users during Maintenance Mode
   if (getMaintenanceState() && ctx.from) {
-    const isAdmin = await checkIsAdmin(ctx);
+    const isAdmin = checkIsAdmin(ctx);
     if (!isAdmin) {
       if (ctx.callbackQuery) {
         return ctx.answerCbQuery(MAINTENANCE_POPUP, { show_alert: true });
@@ -541,44 +511,18 @@ bot.hears(/^\/admin(@\w+)?$/i, async (ctx) => {
     return;
   }
 
-  const isAdmin = await checkIsAdmin(ctx);
-  if (!isAdmin) {
-    return ctx.reply('⛔ <i>Access Denied. Yeh command sirf Admin ke liye reserved hai.</i>', { parse_mode: 'HTML' });
+  if (!checkIsAdmin(ctx)) {
+    return; // Dusre kisi user ke liye 100% Silent
   }
 
   await ctx.reply(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
 });
 
 // -------------------------------------------------------------
-// 👑 ADMIN COMMAND: /setadmin (Claims or Sets Admin ID)
-// -------------------------------------------------------------
-bot.hears(/^\/setadmin(@\w+)?( .*)?$/i, async (ctx) => {
-  if (ctx.chat.type !== 'private') return;
-
-  const currentAdmin = getSavedAdminId();
-  const senderId = String(ctx.from.id);
-
-  try {
-    const member = await ctx.telegram.getChatMember(GROUP_CHAT_ID, senderId);
-    if (member && ['creator', 'administrator'].includes(member.status)) {
-      saveAdminId(senderId);
-      return ctx.reply(`👑 <b>Super Admin Locked Successfully!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Admin ID:</b> <code>${senderId}</code>\n\nAb aapke paas full master control hai. Type karein: <b>/admin</b>`, { parse_mode: 'HTML' });
-    }
-  } catch (e) {}
-
-  if (!currentAdmin) {
-    saveAdminId(senderId);
-    return ctx.reply(`👑 <b>Super Admin Set to your ID:</b> <code>${senderId}</code>\nType karein: <b>/admin</b>`, { parse_mode: 'HTML' });
-  }
-
-  return ctx.reply('⛔ Access Denied.');
-});
-
-// -------------------------------------------------------------
 // 👑 ADMIN DASHBOARD ACTIONS (Inline Buttons Handler)
 // -------------------------------------------------------------
 bot.action('adm_toggle_att', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   const current = getAttendanceState();
   setAttendanceState(!current);
@@ -591,7 +535,7 @@ bot.action('adm_toggle_att', async (ctx) => {
 });
 
 bot.action('adm_toggle_holiday', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   const isHol = isHolidayToday();
   if (isHol) {
@@ -608,7 +552,7 @@ bot.action('adm_toggle_holiday', async (ctx) => {
 });
 
 bot.action('adm_toggle_maint', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   const current = getMaintenanceState();
   setMaintenanceState(!current);
@@ -621,7 +565,7 @@ bot.action('adm_toggle_maint', async (ctx) => {
 });
 
 bot.action('adm_export_csv', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   await ctx.answerCbQuery('⏳ CSV Sheet generate ho rahi hai...', { show_alert: false });
   try {
@@ -640,7 +584,7 @@ bot.action('adm_export_csv', async (ctx) => {
 });
 
 bot.action('adm_sync_members', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   await ctx.answerCbQuery('🔄 Group members sync ho rahe hain...', { show_alert: false });
   try {
@@ -668,7 +612,7 @@ bot.action('adm_sync_members', async (ctx) => {
 });
 
 bot.action('adm_test_report', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   await ctx.answerCbQuery('📊 Sending test report to your DM...', { show_alert: false });
   try {
@@ -679,7 +623,7 @@ bot.action('adm_test_report', async (ctx) => {
 });
 
 bot.action('adm_refresh', async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   await ctx.answerCbQuery('🔄 Status updated!', { show_alert: false });
   try {
@@ -692,21 +636,21 @@ bot.action('adm_refresh', async (ctx) => {
 // -------------------------------------------------------------
 bot.hears(/^\/attendanceon(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   setAttendanceState(true);
   await ctx.reply('🟢 <b>Attendance is now turned ON!</b>', { parse_mode: 'HTML' });
 });
 
 bot.hears(/^\/attendanceoff(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   setAttendanceState(false);
   await ctx.reply('🔴 <b>Attendance is now turned OFF!</b>', { parse_mode: 'HTML' });
 });
 
 bot.hears(/^\/holiday(@\w+)?( .*)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
 
   const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
   const reason = args || 'Official Holiday';
@@ -717,20 +661,20 @@ bot.hears(/^\/holiday(@\w+)?( .*)?$/i, async (ctx) => {
 
 bot.hears(/^\/serverdown(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   setMaintenanceState(true);
   await ctx.reply('🛠️ <b>Server Maintenance Mode Activated!</b>\nGroup members ko maintenance message dikhega.', { parse_mode: 'HTML' });
 });
 
 bot.hears(/^\/serverup(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   setMaintenanceState(false);
   await ctx.reply('🚀 <b>Server Live! Normal Mode Restored.</b>', { parse_mode: 'HTML' });
 });
 
 bot.hears(/^\/testreport(@\w+)?$/i, async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   if (ctx.message && ctx.message.message_id) {
     setTimeout(() => {
       ctx.deleteMessage(ctx.message.message_id).catch(() => {});
@@ -740,7 +684,7 @@ bot.hears(/^\/testreport(@\w+)?$/i, async (ctx) => {
 });
 
 bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   const userMsgId = ctx.message ? ctx.message.message_id : null;
   try {
     const waitMsg = await ctx.reply('⏳ Checking & syncing group members with Telegram...');
@@ -780,7 +724,7 @@ bot.hears(/^\/syncmembers(@\w+)?$/i, async (ctx) => {
 });
 
 bot.hears(/^\/(csv|cvc|export)(@\w+)?$/i, async (ctx) => {
-  if (!(await checkIsAdmin(ctx))) return;
+  if (!checkIsAdmin(ctx)) return;
   const userMessageId = ctx.message ? ctx.message.message_id : null;
   try {
     const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
