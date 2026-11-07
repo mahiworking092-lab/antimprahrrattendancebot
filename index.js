@@ -145,6 +145,8 @@ function getAttendanceKeyboard() {
 }
 
 const pendingLeaveRequests = new Map();
+let waitingAdminHolidayReason = false;
+let holidayPromptMsgId = null;
 
 // -------------------------------------------------------------
 // 🎛️ Admin Dashboard Generator (Private Chat Only)
@@ -196,6 +198,37 @@ function getAdminKeyboard() {
 bot.use(async (ctx, next) => {
   if (ctx.from) {
     db.registerMember(ctx.from.id, ctx.from.first_name, ctx.from.username).catch(() => {});
+  }
+
+  // Intercept Admin Holiday Reason input in Private DM
+  if (ctx.chat && ctx.chat.type === 'private' && checkIsAdmin(ctx) && waitingAdminHolidayReason) {
+    if (ctx.message && ctx.message.text && !ctx.message.text.startsWith('/')) {
+      waitingAdminHolidayReason = false;
+      const reason = ctx.message.text.trim();
+      setHolidayState(true, reason);
+
+      // 1. Group me Official Beautiful Announcement bhejein
+      const groupNotice = `🌸 <b>ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🏖️ <b>OFFICIAL HOLIDAY NOTICE</b> 🎉\n\n📢 <b>Aaj Chhutti (Holiday) ghoshit ki gayi hai!</b>\n📌 <b>Reason:</b> <i>${escapeHTML(reason)}</i>\n━━━━━━━━━━━━━━━━━━━━━━\n✨ Aaj daily attendance band rahegi. Kisi ka Absent mark nahi hoga. Sabhi log enjoy karein! 💗`;
+      await bot.telegram.sendMessage(GROUP_CHAT_ID, groupNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+      // 2. Active buttons group se turant delete karein
+      const idsToDelete = [...new Set([...activeAttendanceMessageIds, ...getStoredMessageIds()])];
+      for (const msgId of idsToDelete) {
+        await bot.telegram.deleteMessage(GROUP_CHAT_ID, msgId).catch(() => {});
+      }
+      activeAttendanceMessageIds = [];
+      saveStoredMessageIds([]);
+
+      // 3. Admin ko confirmation aur updated dashboard bhejein
+      if (holidayPromptMsgId) {
+        ctx.deleteMessage(holidayPromptMsgId).catch(() => {});
+        holidayPromptMsgId = null;
+      }
+
+      await ctx.reply(`🏖️ <b>Holiday successfully declare ho gayi!</b>\n📢 <i>Group me announcement post kar di gayi hai.</i>`, { parse_mode: 'HTML' });
+      await ctx.reply(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+      return;
+    }
   }
 
   // Intercept normal users during Maintenance Mode
@@ -308,7 +341,6 @@ cron.schedule('0 6 * * *', async () => {
     const msg = `🌸 ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️\n💗 ᴅᴀɪʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ɪꜱ ɴᴏᴡ ᴏᴘᴇɴ\n⏰ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴛɪᴍɪɴɢ\n🕕 <b>06:00 AM – 11:30 AM (IST)</b>\n📌 ᴀᴘɴɪ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ᴍᴀʀᴋ ᴋᴀʀɴᴇ ᴋᴇ ʟɪʏᴇ ɴɪᴄʜᴇ ᴅɪʏᴇ ɢᴀʏᴇ ʙᴜᴛᴛᴏNꜱ ᴘᴀʀ ᴄʟɪᴄᴋ ᴋᴀʀᴇɴ. 💗`;
     const sentMsg = await bot.telegram.sendMessage(GROUP_CHAT_ID, msg, { parse_mode: 'HTML', ...getAttendanceKeyboard() });
     
-    // Save Message ID to delete at 11:30 AM
     activeAttendanceMessageIds.push(sentMsg.message_id);
     saveStoredMessageIds(activeAttendanceMessageIds);
 
@@ -383,7 +415,7 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
 
     const absentUsers = members.filter(m => !presentUserIds.has(String(m.userId)) && !leaveUserIds.has(String(m.userId)));
 
-    // Calculate Consecutive Inactive (3+ days)
+    // Consecutive Inactive (3+ days)
     const warnings = [];
     for (const member of absentUsers) {
       const mId = String(member.userId);
@@ -394,13 +426,12 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
       }
     }
 
-    // Attendance Turnout Percentage & Visual Progress Bar
     const turnoutRate = totalMembersCount > 0 ? Math.round((presentUsers.length / totalMembersCount) * 100) : 0;
     const filledBlocks = Math.round((turnoutRate / 100) * 10);
     const emptyBlocks = 10 - filledBlocks;
     const progressBar = '▰'.repeat(filledBlocks) + '▱'.repeat(emptyBlocks);
 
-    // Calculate Streaks for Present Members to build Top 3 Leaderboard
+    // Streaks for Present Members
     const streakList = [];
     for (const pUser of presentUsers) {
       const uId = String(pUser.userId);
@@ -429,7 +460,6 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
       leaderboardText = '  <i>No streaks recorded today</i>';
     }
 
-    // Leave list
     let leaveText = '';
     if (leaveUsers.length > 0) {
       leaveText = leaveUsers.slice(0, 5).map(u => `• <code>${escapeHTML(u.name || 'Unknown')}</code> <i>(${escapeHTML(u.reason || 'No reason')})</i>`).join('\n');
@@ -438,7 +468,6 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
       leaveText = '  <i>None</i>';
     }
 
-    // Warning text
     let warningText = '';
     if (warnings.length > 0) {
       warningText = warnings.slice(0, 6).map(n => `<code>${n}</code> ⚠️`).join(', ');
@@ -447,7 +476,6 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
       warningText = '  <i>Sabhi active hain! (None)</i>';
     }
 
-    // Motivational quotes
     const quotes = [
       'सफलता एक दिन में नहीं मिलती, लेकिन एक दिन ज़रूर मिलती है।',
       'निरंतर प्रयास ही सफलता की सबसे बड़ी कुंजी है।',
@@ -511,9 +539,7 @@ bot.hears(/^\/admin(@\w+)?$/i, async (ctx) => {
     return;
   }
 
-  if (!checkIsAdmin(ctx)) {
-    return; // Dusre kisi user ke liye 100% Silent
-  }
+  if (!checkIsAdmin(ctx)) return;
 
   await ctx.reply(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
 });
@@ -534,55 +560,74 @@ bot.action('adm_toggle_att', async (ctx) => {
   } catch (e) {}
 });
 
+// 1. Holiday Button Handler: Asks for Reason or Cancels
 bot.action('adm_toggle_holiday', async (ctx) => {
   if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   const isHol = isHolidayToday();
   if (isHol) {
     setHolidayState(false, '');
-    await ctx.answerCbQuery('☀️ Holiday hatakar normal day kar diya gaya!', { show_alert: true });
-  } else {
-    setHolidayState(true, 'Official Holiday');
-    await ctx.answerCbQuery('🏖️ Aaj Holiday ghoshit kar di gayi! Absent mark nahi hoga.', { show_alert: true });
-  }
+    await ctx.answerCbQuery('☀️ Holiday Cancelled! Normal mode restored.', { show_alert: true });
 
+    // Group me Holiday Cancellation ka notice bhejein
+    const cancelNotice = `☀️ <b>HOLIDAY CANCELLED!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📢 <i>Admin Mahi dwara Holiday cancel kar di gayi hai. Attendance system normal live hai!</i> 🌸`;
+    await bot.telegram.sendMessage(GROUP_CHAT_ID, cancelNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+    try {
+      await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+    } catch (e) {}
+  } else {
+    // Prompt Admin in DM to enter reason
+    waitingAdminHolidayReason = true;
+    await ctx.answerCbQuery();
+
+    const cancelPromptKb = Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel Request', 'adm_cancel_holiday_prompt')]
+    ]);
+
+    const prompt = await ctx.reply(
+      `🏖️ <b>DECLARE HOLIDAY (CHHUTTI):</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📝 <b>Admin Mahi, kripya chhutti ka Reason (karan) likh kar bhejein:</b>\n<i>(Jaise: Diwali Celebration, Sunday Rest, Technical Work, etc.)</i>\n\nAapke reason likhte hi <b>turant Group me notice chala jayega!</b>`,
+      { parse_mode: 'HTML', ...cancelPromptKb }
+    );
+    holidayPromptMsgId = prompt.message_id;
+  }
+});
+
+bot.action('adm_cancel_holiday_prompt', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  waitingAdminHolidayReason = false;
+  holidayPromptMsgId = null;
+  await ctx.answerCbQuery('❌ Holiday request cancel kar di gayi.');
   try {
-    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+    await ctx.deleteMessage();
   } catch (e) {}
 });
 
+// 2. Server Down Button: Notifies Group & Toggles Maintenance
 bot.action('adm_toggle_maint', async (ctx) => {
   if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
   const current = getMaintenanceState();
   setMaintenanceState(!current);
-  const statusStr = !current ? '🛠️ Server Maintenance Mode ON!' : '🚀 Server Live (Normal Mode) restored!';
-  await ctx.answerCbQuery(statusStr, { show_alert: true });
+
+  if (!current) {
+    // Maintenance Mode ON -> Group me notice bhejein
+    await ctx.answerCbQuery('🛠️ Server Maintenance Mode Activated!', { show_alert: true });
+    const downNotice = `⚠️ <b>SERVER MAINTENANCE NOTICE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👩‍💻 <b>Admin Mahi is currently working on Data Server.</b>\n⚙️ <i>Bot functions are temporarily paused to protect attendance records.\nServices will resume shortly. Thank you for your patience!</i> 🌸`;
+    await bot.telegram.sendMessage(GROUP_CHAT_ID, downNotice, { parse_mode: 'HTML' }).catch(() => {});
+  } else {
+    // Maintenance Mode OFF -> Group me live notice bhejein
+    await ctx.answerCbQuery('🚀 Server Live (Normal Mode) restored!', { show_alert: true });
+    const upNotice = `🚀 <b>SERVER RESTORED! LIVE NOW</b>\n━━━━━━━━━━━━━━━━━━━━━━\n✅ <i>Data server maintenance complete ho chuki hai. Services wapas normal live hain!</i> 🌸`;
+    await bot.telegram.sendMessage(GROUP_CHAT_ID, upNotice, { parse_mode: 'HTML' }).catch(() => {});
+  }
 
   try {
     await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
   } catch (e) {}
 });
 
-bot.action('adm_export_csv', async (ctx) => {
-  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
-
-  await ctx.answerCbQuery('⏳ CSV Sheet generate ho rahi hai...', { show_alert: false });
-  try {
-    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
-    const filePath = await db.generateCSVFilePath();
-    const allAttendance = await db.getAllAttendance();
-
-    await ctx.replyWithDocument({ source: filePath, filename: `attendance_${today}.csv` }, {
-      caption: `📁 <b>Admin Export (Excel/CSV)</b>\n📅 Generated on: <code>${today}</code>\nTotal Records: <code>${allAttendance.length}</code>`,
-      parse_mode: 'HTML'
-    });
-  } catch (err) {
-    console.error('[CSV EXPORT ERROR]:', err);
-    ctx.reply('⚠️ CSV export fail ho gaya.').catch(() => {});
-  }
-});
-
+// 3. Sync Members: Cleans database and posts update in Group
 bot.action('adm_sync_members', async (ctx) => {
   if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
@@ -604,21 +649,91 @@ bot.action('adm_sync_members', async (ctx) => {
       }
     }
 
+    // Admin DM reply
     await ctx.reply(`✅ <b>Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🧹 <code>${removedCount}</code> left members database se remove kar diye gaye hain.`, { parse_mode: 'HTML' });
+
+    // Group me 15 second ke liye notice bhejein
+    const groupNotice = await bot.telegram.sendMessage(
+      GROUP_CHAT_ID,
+      `🔄 <b>DATABASE SYNC COMPLETED</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🧹 <code>${removedCount}</code> inactive/left members ko database se clean kar diya gaya hai. ✅`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+
+    if (groupNotice) {
+      setTimeout(() => {
+        bot.telegram.deleteMessage(GROUP_CHAT_ID, groupNotice.message_id).catch(() => {});
+      }, 15000);
+    }
+
   } catch (err) {
     console.error('[SYNC ERROR]:', err);
     ctx.reply('⚠️ Sync karte waqt error aaya.').catch(() => {});
   }
 });
 
+// 4. Test Report: Asks Admin (DM me ya Group me?)
 bot.action('adm_test_report', async (ctx) => {
   if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
 
-  await ctx.answerCbQuery('📊 Sending test report to your DM...', { show_alert: false });
+  await ctx.answerCbQuery();
+  const testChoiceKeyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('👤 Sirf Yahan (DM me)', 'adm_send_test_dm'),
+      Markup.button.callback('👥 Group me Bhejein', 'adm_send_test_group')
+    ],
+    [
+      Markup.button.callback('❌ Cancel', 'adm_cancel_test_choice')
+    ]
+  ]);
+
+  await ctx.reply(
+    `📊 <b>TEST NIGHT REPORT:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n❓ <i>Aap report kahan send karna chahte hain?</i>`,
+    { parse_mode: 'HTML', ...testChoiceKeyboard }
+  );
+});
+
+bot.action('adm_send_test_dm', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  await ctx.answerCbQuery('📊 Sending to your DM...');
   try {
+    await ctx.deleteMessage();
     await sendDailyAttendanceReport(ctx.chat.id);
+  } catch (e) {}
+});
+
+bot.action('adm_send_test_group', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  await ctx.answerCbQuery('📊 Sending to Group...');
+  try {
+    await ctx.deleteMessage();
+    await sendDailyAttendanceReport(GROUP_CHAT_ID);
+    await ctx.reply('✅ <b>Test Report Group me successfully send kar di gayi hai!</b>', { parse_mode: 'HTML' });
+  } catch (e) {}
+});
+
+bot.action('adm_cancel_test_choice', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery();
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {}
+});
+
+bot.action('adm_export_csv', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('⏳ CSV Sheet generate ho rahi hai...', { show_alert: false });
+  try {
+    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    const filePath = await db.generateCSVFilePath();
+    const allAttendance = await db.getAllAttendance();
+
+    await ctx.replyWithDocument({ source: filePath, filename: `attendance_${today}.csv` }, {
+      caption: `📁 <b>Admin Export (Excel/CSV)</b>\n📅 Generated on: <code>${today}</code>\nTotal Records: <code>${allAttendance.length}</code>`,
+      parse_mode: 'HTML'
+    });
   } catch (err) {
-    ctx.reply('⚠️ Report generate karte waqt error aaya.').catch(() => {});
+    console.error('[CSV EXPORT ERROR]:', err);
+    ctx.reply('⚠️ CSV export fail ho gaya.').catch(() => {});
   }
 });
 
@@ -649,28 +764,61 @@ bot.hears(/^\/attendanceoff(@\w+)?$/i, async (ctx) => {
 });
 
 bot.hears(/^\/holiday(@\w+)?( .*)?$/i, async (ctx) => {
-  if (ctx.chat.type !== 'private') return;
   if (!checkIsAdmin(ctx)) return;
 
   const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
   const reason = args || 'Official Holiday';
   setHolidayState(true, reason);
 
-  await ctx.reply(`🏖️ <b>Holiday Declared for Today!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📌 <b>Reason:</b> <i>${escapeHTML(reason)}</i>\n✨ <i>Subah buttons nahi aayenge aur raat ko koi Absent mark nahi hoga.</i>`, { parse_mode: 'HTML' });
+  // Group me Sundar Announcement Notice bhejein
+  const groupNotice = `🌸 <b>ʀᴀᴅʜᴇ ʀᴀᴅʜᴇ! ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜ ᴀʟʟ☀️</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🏖️ <b>OFFICIAL HOLIDAY NOTICE</b> 🎉\n\n📢 <b>Aaj Chhutti (Holiday) ghoshit ki gayi hai!</b>\n📌 <b>Reason:</b> <i>${escapeHTML(reason)}</i>\n━━━━━━━━━━━━━━━━━━━━━━\n✨ Aaj daily attendance band rahegi. Kisi ka Absent mark nahi hoga. Sabhi log enjoy karein! 💗`;
+  await bot.telegram.sendMessage(GROUP_CHAT_ID, groupNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+  // Active attendance buttons group se turant hata dein
+  const idsToDelete = [...new Set([...activeAttendanceMessageIds, ...getStoredMessageIds()])];
+  for (const msgId of idsToDelete) {
+    await bot.telegram.deleteMessage(GROUP_CHAT_ID, msgId).catch(() => {});
+  }
+  activeAttendanceMessageIds = [];
+  saveStoredMessageIds([]);
+
+  if (ctx.chat.type === 'private') {
+    await ctx.reply(`🏖️ <b>Holiday Declared for Today!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📌 <b>Reason:</b> <i>${escapeHTML(reason)}</i>\n📢 <b>Group me Notice successfully bhej diya gaya hai!</b>\n✨ <i>Subah buttons nahi aayenge aur raat ko koi Absent mark nahi hoga.</i>`, { parse_mode: 'HTML' });
+  } else {
+    setTimeout(() => {
+      ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+    }, 1000);
+  }
+});
+
+bot.hears(/^\/(holidayoff|cancelholiday)(@\w+)?$/i, async (ctx) => {
+  if (!checkIsAdmin(ctx)) return;
+  setHolidayState(false, '');
+
+  const cancelNotice = `☀️ <b>HOLIDAY CANCELLED!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📢 <i>Admin Mahi dwara Holiday cancel kar di gayi hai. Attendance system normal live hai!</i> 🌸`;
+  await bot.telegram.sendMessage(GROUP_CHAT_ID, cancelNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+  if (ctx.chat.type === 'private') {
+    await ctx.reply('☀️ <b>Holiday hatakar normal day restore kar diya gaya hai! Group me notice bhej diya gaya.</b>', { parse_mode: 'HTML' });
+  }
 });
 
 bot.hears(/^\/serverdown(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   if (!checkIsAdmin(ctx)) return;
   setMaintenanceState(true);
-  await ctx.reply('🛠️ <b>Server Maintenance Mode Activated!</b>\nGroup members ko maintenance message dikhega.', { parse_mode: 'HTML' });
+  const downNotice = `⚠️ <b>SERVER MAINTENANCE NOTICE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👩‍💻 <b>Admin Mahi is currently working on Data Server.</b>\n⚙️ <i>Bot functions are temporarily paused to protect attendance records.\nServices will resume shortly. Thank you for your patience!</i> 🌸`;
+  await bot.telegram.sendMessage(GROUP_CHAT_ID, downNotice, { parse_mode: 'HTML' }).catch(() => {});
+  await ctx.reply('🛠️ <b>Server Maintenance Mode Activated!</b>\nGroup members ko maintenance notice bhej diya gaya.', { parse_mode: 'HTML' });
 });
 
 bot.hears(/^\/serverup(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   if (!checkIsAdmin(ctx)) return;
   setMaintenanceState(false);
-  await ctx.reply('🚀 <b>Server Live! Normal Mode Restored.</b>', { parse_mode: 'HTML' });
+  const upNotice = `🚀 <b>SERVER RESTORED! LIVE NOW</b>\n━━━━━━━━━━━━━━━━━━━━━━\n✅ <i>Data server maintenance complete ho chuki hai. Services wapas normal live hain!</i> 🌸`;
+  await bot.telegram.sendMessage(GROUP_CHAT_ID, upNotice, { parse_mode: 'HTML' }).catch(() => {});
+  await ctx.reply('🚀 <b>Server Live! Normal Mode Restored.</b>\nGroup me restore notice bhej diya gaya.', { parse_mode: 'HTML' });
 });
 
 bot.hears(/^\/testreport(@\w+)?$/i, async (ctx) => {
