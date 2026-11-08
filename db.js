@@ -192,11 +192,91 @@ async function generateCSVFilePath() {
   return exportPath;
 }
 
+// Generate Monthly Summary CSV File
+async function generateMonthlyCSVFilePath(monthYear) {
+  const allAttendance = await getAllAttendance();
+  const allMembers = await getAllMembers();
+
+  const monthRecords = allAttendance.filter(r => {
+    if (!r.date) return false;
+    const parts = String(r.date).trim().split('-');
+    if (parts.length === 3) {
+      return `${parts[1]}-${parts[2]}` === monthYear;
+    }
+    return false;
+  });
+
+  const uniqueDates = [...new Set(monthRecords.map(r => r.date))];
+  const totalDays = uniqueDates.length;
+
+  const escapeCsv = (str) => `"${String(str || '').replace(/"/g, '""')}"`;
+  const rows = [];
+  rows.push(`"MONTHLY ATTENDANCE SUMMARY (${monthYear})"`);
+  rows.push(`"Total Working/Recorded Days",${totalDays}`);
+  rows.push(`"Total Registered Members",${allMembers.length}`);
+  rows.push('');
+  rows.push(['Rank', 'Name', 'Username', 'User ID', 'Present Days', 'Leave Days', 'Absent Days', 'Attendance Rate %'].map(escapeCsv).join(','));
+
+  const memberStats = allMembers.map(m => {
+    const uId = String(m.userId);
+    const mRecords = monthRecords.filter(r => String(r.userId) === uId);
+    const presents = mRecords.filter(r => String(r.status || 'Present').trim() === 'Present').length;
+    const leaves = mRecords.filter(r => String(r.status || '').trim() === 'Leave').length;
+    const absents = Math.max(0, totalDays - (presents + leaves));
+    const rate = totalDays > 0 ? Math.round((presents / totalDays) * 100) : 0;
+    return {
+      userId: uId,
+      name: m.name || 'Unknown',
+      username: m.username ? `@${m.username}` : '',
+      presents,
+      leaves,
+      absents,
+      rate
+    };
+  });
+
+  memberStats.sort((a, b) => b.presents - a.presents || b.rate - a.rate);
+
+  memberStats.forEach((st, idx) => {
+    rows.push([
+      idx + 1,
+      escapeCsv(st.name),
+      escapeCsv(st.username),
+      escapeCsv(st.userId),
+      st.presents,
+      st.leaves,
+      st.absents,
+      `${st.rate}%`
+    ].join(','));
+  });
+
+  rows.push('');
+  rows.push('"--- DETAILED DAILY LOGS ---"');
+  rows.push(['Date', 'User ID', 'Name', 'Username', 'Status', 'Reason', 'Timestamp'].map(escapeCsv).join(','));
+  monthRecords.sort((a, b) => a.date.localeCompare(b.date));
+  for (const r of monthRecords) {
+    rows.push([
+      escapeCsv(r.date),
+      escapeCsv(r.userId),
+      escapeCsv(r.name),
+      escapeCsv(r.username),
+      escapeCsv(r.status),
+      escapeCsv(r.reason),
+      escapeCsv(r.timestamp)
+    ].join(','));
+  }
+
+  const exportPath = path.join(__dirname, `monthly_attendance_${monthYear}.csv`);
+  fs.writeFileSync(exportPath, rows.join('\n'), 'utf8');
+  return { filePath: exportPath, totalDays, memberCount: allMembers.length, monthRecordsCount: monthRecords.length };
+}
+
 module.exports = {
   registerMember,
   removeMember,
   getAllMembers,
   getAllAttendance,
   addAttendance,
-  generateCSVFilePath
+  generateCSVFilePath,
+  generateMonthlyCSVFilePath
 };
