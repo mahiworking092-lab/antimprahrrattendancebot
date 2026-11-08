@@ -438,11 +438,27 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
 
     if (isHolidayToday()) {
+      setHolidayState(false, ''); // Reset single day holiday
+      if (targetChatId === GROUP_CHAT_ID) {
+        console.log('[REPORT] Holiday active, skipped sending report to group.');
+        return;
+      }
       const hol = getHolidayState();
       const holMsg = `🏖️ <b>DAILY SUMMARY (HOLIDAY)</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📅 <b>Date:</b> <code>${today}</code>\n🎉 <b>Aaj Holiday thi:</b> <i>${escapeHTML(hol.reason || 'Rest Day')}</i>\n✨ <i>Kisi bhi member ka Absent mark nahi hua hai. Kal attendance normal shuru hogi!</i> 🌸`;
       await bot.telegram.sendMessage(targetChatId, holMsg, { parse_mode: 'HTML' });
-      setHolidayState(false, ''); // Reset single day holiday
       return;
+    }
+
+    // Agar Group me report bhej rahe hain aur Attendance OFF ya Server Down hai, toh skip karein
+    if (targetChatId === GROUP_CHAT_ID) {
+      if (!getAttendanceState()) {
+        console.log('[REPORT] Attendance OFF thi, group me night report nahi jayegi.');
+        return;
+      }
+      if (getMaintenanceState()) {
+        console.log('[REPORT] Server Down tha, group me night report nahi jayegi.');
+        return;
+      }
     }
 
     const members = await db.getAllMembers();
@@ -722,6 +738,23 @@ ${topList}
 // 2. Cron Job: 9:00 PM Daily Attendance Report Summary
 // -------------------------------------------------------------
 cron.schedule('0 21 * * *', async () => {
+  // Agar Holiday hai, Attendance OFF hai, ya Server Down hai -> Group me Night Report NAHI jayegi
+  if (isHolidayToday()) {
+    console.log('[CRON] 9:00 PM: Holiday active, skipping night report.');
+    setHolidayState(false, ''); // Agle din ke liye auto-reset
+    return;
+  }
+
+  if (!getAttendanceState()) {
+    console.log('[CRON] 9:00 PM: Attendance OFF thi, skipping night report.');
+    return;
+  }
+
+  if (getMaintenanceState()) {
+    console.log('[CRON] 9:00 PM: Server Down active, skipping night report.');
+    return;
+  }
+
   await sendDailyAttendanceReport(GROUP_CHAT_ID);
 }, { timezone: 'Asia/Kolkata' });
 
