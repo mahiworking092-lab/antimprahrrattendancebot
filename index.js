@@ -147,6 +147,8 @@ function getAttendanceKeyboard() {
 const pendingLeaveRequests = new Map();
 let waitingAdminHolidayReason = false;
 let holidayPromptMsgId = null;
+let waitingAdminReportDate = false;
+let datePromptMsgId = null;
 
 // -------------------------------------------------------------
 // 🎛️ Admin Dashboard Generator (Private Chat Only)
@@ -176,7 +178,7 @@ function getAdminKeyboard() {
   return Markup.inlineKeyboard([
     [
       Markup.button.callback(attState ? '🔴 Turn OFF Attendance' : '🟢 Turn ON Attendance', 'adm_toggle_att'),
-      Markup.button.callback(holState ? '☀️ Cancel Holiday' : '🏖️ Declare Holiday', 'adm_toggle_holiday')
+      Markup.button.callback(holState ? '☀️ Cancel Holiday' : '🏖️ Declare Holiday', holState ? 'adm_cancel_holiday' : 'adm_declare_holiday')
     ],
     [
       Markup.button.callback(maintState ? '🚀 Restore Server (UP)' : '🛠️ Server Down Mode', 'adm_toggle_maint')
@@ -187,7 +189,26 @@ function getAdminKeyboard() {
     ],
     [
       Markup.button.callback('📊 Test Night Report', 'adm_test_report'),
+      Markup.button.callback('🗓️ Past & Month Reports', 'adm_past_reports')
+    ],
+    [
       Markup.button.callback('🔄 Refresh Status', 'adm_refresh')
+    ]
+  ]);
+}
+
+function getReportsKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('📊 Kal (Yesterday) ki Report', 'adm_rep_yesterday'),
+      Markup.button.callback('🗓️ Is Mahine (Month) Summary', 'adm_rep_month_card')
+    ],
+    [
+      Markup.button.callback('📁 Monthly Excel Sheet', 'adm_rep_month_csv'),
+      Markup.button.callback('🔍 Kisi Date ki Report', 'adm_rep_custom_date')
+    ],
+    [
+      Markup.button.callback('🔙 Back to Main Control Panel', 'adm_refresh')
     ]
   ]);
 }
@@ -227,6 +248,28 @@ bot.use(async (ctx, next) => {
 
       await ctx.reply(`🏖️ <b>Holiday successfully declare ho gayi!</b>\n📢 <i>Group me announcement post kar di gayi hai.</i>`, { parse_mode: 'HTML' });
       await ctx.reply(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+      return;
+    }
+  }
+
+  // Intercept Admin Custom Date input for Reports in Private DM
+  if (ctx.chat && ctx.chat.type === 'private' && checkIsAdmin(ctx) && waitingAdminReportDate) {
+    if (ctx.message && ctx.message.text && !ctx.message.text.startsWith('/')) {
+      waitingAdminReportDate = false;
+      const inputDate = ctx.message.text.trim();
+      if (datePromptMsgId) {
+        ctx.deleteMessage(datePromptMsgId).catch(() => {});
+        datePromptMsgId = null;
+      }
+
+      const parts = inputDate.split('-');
+      if (parts.length !== 3 || isNaN(parts[0]) || isNaN(parts[1]) || isNaN(parts[2])) {
+        await ctx.reply(`⚠️ <b>Galat Format!</b> Kripya date is tarah likhein: <code>DD-MM-YYYY</code>\n<i>Udaharan: 05-11-2026</i>`, { parse_mode: 'HTML' });
+        return;
+      }
+
+      const rep = await getDateAttendanceReport(inputDate);
+      await ctx.reply(rep.text, { parse_mode: 'HTML' });
       return;
     }
   }
@@ -364,6 +407,12 @@ cron.schedule('30 11 * * *', async () => {
 
     activeAttendanceMessageIds = [];
     saveStoredMessageIds([]);
+
+    // Agar Holiday hai, Attendance OFF hai, ya Server Down hai, toh "Closed" message group me NAHI jayega
+    if (isHolidayToday() || !getAttendanceState() || getMaintenanceState()) {
+      console.log('[CRON] 11:30 AM: Skipped closed notice because holiday/attendance-off/maintenance is active.');
+      return;
+    }
 
     const closedMsg = await bot.telegram.sendMessage(
       GROUP_CHAT_ID,
@@ -524,6 +573,152 @@ ${warningText}
 }
 
 // -------------------------------------------------------------
+// Functions: Generate Specific Date & Monthly Summary Reports
+// -------------------------------------------------------------
+async function getDateAttendanceReport(targetDateStr) {
+  try {
+    const members = await db.getAllMembers();
+    const attendance = await db.getAllAttendance();
+
+    const totalMembersCount = members.length;
+    const dayRecords = attendance.filter(r => String(r.date).trim() === targetDateStr);
+
+    if (dayRecords.length === 0) {
+      return {
+        found: false,
+        text: `⚠️ <b>Date: <code>${targetDateStr}</code></b>\n━━━━━━━━━━━━━━━━━━━━━━\nIs tarikh ki koi attendance record database me uplabdh nahi hai.`
+      };
+    }
+
+    const presentUsers = dayRecords.filter(r => String(r.status || 'Present').trim() === 'Present');
+    const leaveUsers = dayRecords.filter(r => String(r.status || '').trim() === 'Leave');
+
+    const presentUserIds = new Set(presentUsers.map(u => String(u.userId)));
+    const leaveUserIds = new Set(leaveUsers.map(u => String(u.userId)));
+    const absentUsers = members.filter(m => !presentUserIds.has(String(m.userId)) && !leaveUserIds.has(String(m.userId)));
+
+    const turnoutRate = totalMembersCount > 0 ? Math.round((presentUsers.length / totalMembersCount) * 100) : 0;
+    const filledBlocks = Math.round((turnoutRate / 100) * 10);
+    const emptyBlocks = 10 - filledBlocks;
+    const progressBar = '▰'.repeat(filledBlocks) + '▱'.repeat(emptyBlocks);
+
+    let presentListText = presentUsers.length > 0
+      ? presentUsers.slice(0, 15).map(u => `• <code>${escapeHTML(u.name || 'Unknown')}</code>`).join('\n')
+      : '  <i>Koi present nahi tha</i>';
+    if (presentUsers.length > 15) presentListText += `\n• <i>...and ${presentUsers.length - 15} more</i>`;
+
+    let leaveText = leaveUsers.length > 0
+      ? leaveUsers.slice(0, 8).map(u => `• <code>${escapeHTML(u.name || 'Unknown')}</code> <i>(${escapeHTML(u.reason || 'Leave')})</i>`).join('\n')
+      : '  <i>None</i>';
+    if (leaveUsers.length > 8) leaveText += `\n• <i>...and ${leaveUsers.length - 8} more</i>`;
+
+    let absentText = absentUsers.length > 0
+      ? absentUsers.slice(0, 10).map(u => `<code>${escapeHTML(u.name || 'Unknown')}</code>`).join(', ')
+      : '  <i>Sabhi present the!</i>';
+    if (absentUsers.length > 10) absentText += `, ...and ${absentUsers.length - 10} more`;
+
+    const card = 
+`╭───────────────✦───────────────╮
+│ 📜 <b>ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ʀᴇᴘᴏʀᴛ (${targetDateStr})</b>
+╰───────────────✦───────────────╯
+📅 <b>Target Date:</b> <code>${targetDateStr}</code>
+👥 <b>Total Members:</b> <code>${totalMembersCount}</code>
+
+📈 <b>Attendance Turnout:</b> <code>${turnoutRate}%</code>
+<code>[${progressBar}]</code>
+
+┌──────────── <b>Overview</b> ────────────┐
+│ ✅ <b>Present:</b> <code>${presentUsers.length} Members</code>
+│ 🍂 <b>On Leave:</b> <code>${leaveUsers.length} Members</code>
+│ ❌ <b>Absent:</b> <code>${absentUsers.length} Members</code>
+└──────────────────────────────────┘
+
+✅ <b>Present Members:</b>
+${presentListText}
+
+🍂 <b>Leave Records:</b>
+${leaveText}
+
+❌ <b>Absent Members:</b>
+${absentText}`;
+
+    return { found: true, text: card };
+  } catch (err) {
+    console.error('[GET_DATE_REPORT ERROR]:', err);
+    return { found: false, text: '⚠️ Error generating date report.' };
+  }
+}
+
+async function getMonthlySummaryText(monthYear) {
+  try {
+    const allAttendance = await db.getAllAttendance();
+    const allMembers = await db.getAllMembers();
+
+    const monthRecords = allAttendance.filter(r => {
+      if (!r.date) return false;
+      const parts = String(r.date).trim().split('-');
+      if (parts.length === 3) {
+        return `${parts[1]}-${parts[2]}` === monthYear;
+      }
+      return false;
+    });
+
+    const uniqueDates = [...new Set(monthRecords.map(r => r.date))];
+    const totalDays = uniqueDates.length;
+
+    if (totalDays === 0) {
+      return `⚠️ <b>Month: <code>${monthYear}</code></b>\n━━━━━━━━━━━━━━━━━━━━━━\nIs mahine ka koi attendance data database me record nahi mila.`;
+    }
+
+    const memberStats = allMembers.map(m => {
+      const uId = String(m.userId);
+      const mRecords = monthRecords.filter(r => String(r.userId) === uId);
+      const presents = mRecords.filter(r => String(r.status || 'Present').trim() === 'Present').length;
+      const leaves = mRecords.filter(r => String(r.status || '').trim() === 'Leave').length;
+      const absents = Math.max(0, totalDays - (presents + leaves));
+      const rate = totalDays > 0 ? Math.round((presents / totalDays) * 100) : 0;
+      return {
+        userId: uId,
+        name: m.name || 'Unknown',
+        presents,
+        leaves,
+        absents,
+        rate
+      };
+    });
+
+    memberStats.sort((a, b) => b.presents - a.presents || b.rate - a.rate);
+
+    const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+    const topList = memberStats.slice(0, 10).map((st, idx) => {
+      const icon = medals[idx] || '•';
+      return `${icon} <code>${escapeHTML(st.name)}</code> ➔ <b>${st.presents}/${totalDays} Days</b> (${st.rate}%)`;
+    }).join('\n');
+
+    const totalPresentCount = monthRecords.filter(r => String(r.status || 'Present').trim() === 'Present').length;
+    const totalPossible = totalDays * allMembers.length;
+    const overallAvg = totalPossible > 0 ? Math.round((totalPresentCount / totalPossible) * 100) : 0;
+
+    return `╭───────────────✦───────────────╮
+│ 🗓️ <b>ᴍᴏɴᴛʜʟʏ ᴀᴛᴛᴇɴᴅᴀɴᴄᴇ ꜱᴜᴍᴍᴀʀʏ</b>
+╰───────────────✦───────────────╯
+📅 <b>Month:</b> <code>${monthYear}</code>
+👥 <b>Total Registered Members:</b> <code>${allMembers.length}</code>
+📆 <b>Total Recorded Days:</b> <code>${totalDays} Days</code>
+📈 <b>Group Overall Turnout:</b> <code>${overallAvg}%</code>
+
+🏆 <b>TOP PERFORMERS (Attendance Champions):</b>
+${topList}
+
+━━━━━━━━━━━━━━━━━━━━━━
+💡 <i>Poore mahine ki detailed sheet download karne ke liye <b>Monthly Excel Sheet</b> button dabayein!</i>`;
+  } catch (err) {
+    console.error('[MONTHLY_SUMMARY ERROR]:', err);
+    return '⚠️ Error generating monthly summary.';
+  }
+}
+
+// -------------------------------------------------------------
 // 2. Cron Job: 9:00 PM Daily Attendance Report Summary
 // -------------------------------------------------------------
 cron.schedule('0 21 * * *', async () => {
@@ -560,36 +755,55 @@ bot.action('adm_toggle_att', async (ctx) => {
   } catch (e) {}
 });
 
-// 1. Holiday Button Handler: Asks for Reason or Cancels
+// 1. Holiday Handlers (Separate Dedicated Actions for Cancel and Declare)
+async function doCancelHoliday(ctx) {
+  waitingAdminHolidayReason = false;
+  if (holidayPromptMsgId) {
+    ctx.deleteMessage(holidayPromptMsgId).catch(() => {});
+    holidayPromptMsgId = null;
+  }
+  setHolidayState(false, '');
+  await ctx.answerCbQuery('☀️ Holiday Cancelled! Normal mode restored.', { show_alert: true });
+
+  const cancelNotice = `☀️ <b>HOLIDAY CANCELLED!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📢 <i>Admin Mahi dwara Holiday cancel kar di gayi hai. Attendance system normal live hai!</i> 🌸`;
+  await bot.telegram.sendMessage(GROUP_CHAT_ID, cancelNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+  try {
+    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+  } catch (e) {}
+}
+
+async function doPromptHoliday(ctx) {
+  waitingAdminHolidayReason = true;
+  await ctx.answerCbQuery();
+
+  const cancelPromptKb = Markup.inlineKeyboard([
+    [Markup.button.callback('❌ Cancel Request', 'adm_cancel_holiday_prompt')]
+  ]);
+
+  const prompt = await ctx.reply(
+    `🏖️ <b>DECLARE HOLIDAY (CHHUTTI):</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📝 <b>Admin Mahi, kripya chhutti ka Reason (karan) likh kar bhejein:</b>\n<i>(Jaise: Diwali Celebration, Sunday Rest, Technical Work, etc.)</i>\n\nAapke reason likhte hi <b>turant Group me notice chala jayega!</b>`,
+    { parse_mode: 'HTML', ...cancelPromptKb }
+  );
+  holidayPromptMsgId = prompt.message_id;
+}
+
+bot.action('adm_cancel_holiday', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  await doCancelHoliday(ctx);
+});
+
+bot.action('adm_declare_holiday', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  await doPromptHoliday(ctx);
+});
+
 bot.action('adm_toggle_holiday', async (ctx) => {
   if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
-
-  const isHol = isHolidayToday();
-  if (isHol) {
-    setHolidayState(false, '');
-    await ctx.answerCbQuery('☀️ Holiday Cancelled! Normal mode restored.', { show_alert: true });
-
-    // Group me Holiday Cancellation ka notice bhejein
-    const cancelNotice = `☀️ <b>HOLIDAY CANCELLED!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📢 <i>Admin Mahi dwara Holiday cancel kar di gayi hai. Attendance system normal live hai!</i> 🌸`;
-    await bot.telegram.sendMessage(GROUP_CHAT_ID, cancelNotice, { parse_mode: 'HTML' }).catch(() => {});
-
-    try {
-      await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
-    } catch (e) {}
+  if (isHolidayToday()) {
+    await doCancelHoliday(ctx);
   } else {
-    // Prompt Admin in DM to enter reason
-    waitingAdminHolidayReason = true;
-    await ctx.answerCbQuery();
-
-    const cancelPromptKb = Markup.inlineKeyboard([
-      [Markup.button.callback('❌ Cancel Request', 'adm_cancel_holiday_prompt')]
-    ]);
-
-    const prompt = await ctx.reply(
-      `🏖️ <b>DECLARE HOLIDAY (CHHUTTI):</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📝 <b>Admin Mahi, kripya chhutti ka Reason (karan) likh kar bhejein:</b>\n<i>(Jaise: Diwali Celebration, Sunday Rest, Technical Work, etc.)</i>\n\nAapke reason likhte hi <b>turant Group me notice chala jayega!</b>`,
-      { parse_mode: 'HTML', ...cancelPromptKb }
-    );
-    holidayPromptMsgId = prompt.message_id;
+    await doPromptHoliday(ctx);
   }
 });
 
@@ -746,6 +960,82 @@ bot.action('adm_refresh', async (ctx) => {
   } catch (e) {}
 });
 
+// 5. Past & Monthly Reports Menu
+bot.action('adm_past_reports', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery();
+  const menuText = `🗓️ <b>PAST & MONTHLY ATTENDANCE REPORTS</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Admin Mahi</b>, aap kaunsi report dekhna chahte hain?\n\n• <b>Kal ki Report:</b> Yesterday ka complete overview\n• <b>Is Mahine Summary:</b> Current month rank wise performance\n• <b>Monthly Excel:</b> Poore mahine ki detailed sheet\n• <b>Kisi Date ki:</b> Apni marzi se koi bhi purani date check karein`;
+
+  try {
+    await ctx.editMessageText(menuText, { parse_mode: 'HTML', ...getReportsKeyboard() });
+  } catch (e) {
+    await ctx.reply(menuText, { parse_mode: 'HTML', ...getReportsKeyboard() });
+  }
+});
+
+bot.action('adm_rep_yesterday', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const yesterday = DateTime.now().setZone('Asia/Kolkata').minus({ days: 1 }).toFormat('dd-MM-yyyy');
+  await ctx.answerCbQuery('⏳ Kal ki report load ho rahi hai...');
+  const rep = await getDateAttendanceReport(yesterday);
+  await ctx.reply(rep.text, { parse_mode: 'HTML' });
+});
+
+bot.action('adm_rep_month_card', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const currMonth = DateTime.now().setZone('Asia/Kolkata').toFormat('MM-yyyy');
+  await ctx.answerCbQuery('⏳ Monthly summary load ho rahi hai...');
+  const summaryText = await getMonthlySummaryText(currMonth);
+  await ctx.reply(summaryText, { parse_mode: 'HTML' });
+});
+
+bot.action('adm_rep_month_csv', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const currMonth = DateTime.now().setZone('Asia/Kolkata').toFormat('MM-yyyy');
+  await ctx.answerCbQuery('⏳ Monthly Excel generate ho rahi hai...', { show_alert: false });
+  try {
+    const res = await db.generateMonthlyCSVFilePath(currMonth);
+    await ctx.replyWithDocument({ source: res.filePath, filename: `monthly_attendance_${currMonth}.csv` }, {
+      caption: `📁 <b>Monthly Attendance Excel Sheet (${currMonth})</b>\n👥 Total Members: <code>${res.memberCount}</code>\n📆 Recorded Days: <code>${res.totalDays}</code>`,
+      parse_mode: 'HTML'
+    });
+  } catch (err) {
+    console.error('[MONTHLY CSV ERR]:', err);
+    ctx.reply('⚠️ Monthly CSV generate karne me error aaya.').catch(() => {});
+  }
+});
+
+bot.action('adm_rep_custom_date', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  waitingAdminReportDate = true;
+  await ctx.answerCbQuery();
+
+  const cancelPromptKb = Markup.inlineKeyboard([
+    [Markup.button.callback('❌ Cancel Request', 'adm_cancel_date_prompt')]
+  ]);
+
+  const prompt = await ctx.reply(
+    `📅 <b>KISI BHI DATE KI REPORT:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📝 <b>Admin Mahi, kripya Date likh kar bhejein:</b>\n(Format: <code>DD-MM-YYYY</code>, jaise: <code>07-11-2026</code>)`,
+    { parse_mode: 'HTML', ...cancelPromptKb }
+  );
+  datePromptMsgId = prompt.message_id;
+});
+
+bot.action('adm_cancel_date_prompt', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+  waitingAdminReportDate = false;
+  datePromptMsgId = null;
+  await ctx.answerCbQuery('❌ Date check cancel kar diya gaya.');
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {}
+});
+
 // -------------------------------------------------------------
 // 👑 ADMIN DIRECT TEXT COMMANDS (Only for Admin)
 // -------------------------------------------------------------
@@ -895,6 +1185,47 @@ bot.hears(/^\/(csv|cvc|export)(@\w+)?$/i, async (ctx) => {
   }
 });
 
+bot.hears(/^\/report(@\w+)?( .*)?$/i, async (ctx) => {
+  if (!checkIsAdmin(ctx)) return;
+  const userMessageId = ctx.message ? ctx.message.message_id : null;
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+  let targetDate = '';
+  if (!args || args.toLowerCase() === 'yesterday' || args.toLowerCase() === 'kal') {
+    targetDate = DateTime.now().setZone('Asia/Kolkata').minus({ days: 1 }).toFormat('dd-MM-yyyy');
+  } else {
+    targetDate = args;
+  }
+
+  const rep = await getDateAttendanceReport(targetDate);
+  await ctx.reply(rep.text, { parse_mode: 'HTML' });
+  if (userMessageId && ctx.chat.type !== 'private') {
+    setTimeout(() => { ctx.deleteMessage(userMessageId).catch(() => {}); }, 1000);
+  }
+});
+
+bot.hears(/^\/month(ly)?(@\w+)?$/i, async (ctx) => {
+  if (!checkIsAdmin(ctx)) return;
+  const currMonth = DateTime.now().setZone('Asia/Kolkata').toFormat('MM-yyyy');
+  const summaryText = await getMonthlySummaryText(currMonth);
+  await ctx.reply(summaryText, { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/monthcsv(@\w+)?$/i, async (ctx) => {
+  if (!checkIsAdmin(ctx)) return;
+  const currMonth = DateTime.now().setZone('Asia/Kolkata').toFormat('MM-yyyy');
+  try {
+    const res = await db.generateMonthlyCSVFilePath(currMonth);
+    await ctx.replyWithDocument({ source: res.filePath, filename: `monthly_attendance_${currMonth}.csv` }, {
+      caption: `📁 <b>Monthly Attendance Excel Sheet (${currMonth})</b>\n👥 Total Members: <code>${res.memberCount}</code>\n📆 Recorded Days: <code>${res.totalDays}</code>`,
+      parse_mode: 'HTML'
+    });
+  } catch (err) {
+    console.error('[MONTHLY CSV ERR]:', err);
+    ctx.reply('⚠️ Failed to generate monthly CSV.').catch(() => {});
+  }
+});
+
 // -------------------------------------------------------------
 // 3. Command: /admission form
 // -------------------------------------------------------------
@@ -1004,7 +1335,7 @@ bot.action('btn_present', async (ctx) => {
   }
 
   if (!getAttendanceState()) {
-    return ctx.answerCbQuery('❌ Attendance abhi Admin dwara OFF kar di gayi hai.', { show_alert: true });
+    return ctx.answerCbQuery('❌ Attendance closed hai aaj ka.', { show_alert: true });
   }
 
   const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
@@ -1085,7 +1416,7 @@ bot.action('btn_leave', async (ctx) => {
   }
 
   if (!getAttendanceState()) {
-    return ctx.answerCbQuery('❌ Attendance abhi Admin dwara OFF kar di gayi hai.', { show_alert: true });
+    return ctx.answerCbQuery('❌ Attendance closed hai aaj ka.', { show_alert: true });
   }
 
   const nowKolkata = DateTime.now().setZone('Asia/Kolkata');
@@ -1254,7 +1585,7 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
   }
 
   if (!getAttendanceState()) {
-    const notice = await ctx.reply('❌ <b>Attendance abhi Admin dwara band (OFF) hai.</b>', { parse_mode: 'HTML' });
+    const notice = await ctx.reply('❌ <b>Attendance closed hai aaj ka.</b>', { parse_mode: 'HTML' });
     setTimeout(() => {
       ctx.deleteMessage(userMessageId).catch(() => {});
       ctx.deleteMessage(notice.message_id).catch(() => {});
