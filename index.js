@@ -112,6 +112,25 @@ function isHolidayToday() {
   return hol.date === today;
 }
 
+// 🚫 Auto-Ban State (5+ din bina leave absent = auto ban)
+const AUTOBAN_FILE = path.join(__dirname, 'autoban_state.json');
+
+function getAutoBanState() {
+  try {
+    if (fs.existsSync(AUTOBAN_FILE)) {
+      const data = JSON.parse(fs.readFileSync(AUTOBAN_FILE, 'utf8'));
+      if (typeof data.enabled === 'boolean') return data.enabled;
+    }
+  } catch (e) {}
+  return true; // Default ON
+}
+
+function setAutoBanState(enabled) {
+  try {
+    fs.writeFileSync(AUTOBAN_FILE, JSON.stringify({ enabled }), 'utf8');
+  } catch (e) {}
+}
+
 const MAINTENANCE_POPUP = '⚠️ SERVER MAINTENANCE NOTICE\n\nAdmin Mahi is working on Data Server.\nPlease be patient, service will resume shortly!';
 const MAINTENANCE_CHAT_NOTICE = `<b>⚠️ SERVER MAINTENANCE NOTICE</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👩‍💻 <b>Admin Mahi is currently working on Data Server.</b>\n⚙️ <i>Bot functions are temporarily paused to protect attendance records.\nServices will resume shortly. Thank you for your patience!</i> 🌸`;
 
@@ -194,6 +213,9 @@ function getAdminKeyboard() {
     [
       Markup.button.callback('🚨 Defaulters List (Inactive)', 'adm_defaulters_list'),
       Markup.button.callback('🔄 Refresh Status', 'adm_refresh')
+    ],
+    [
+      Markup.button.callback(getAutoBanState() ? '🔴 Auto-Ban OFF karein' : '🟢 Auto-Ban ON karein', 'adm_toggle_autoban')
     ]
   ]);
 }
@@ -387,6 +409,8 @@ cron.schedule('0 6 * * *', async () => {
     
     activeAttendanceMessageIds.push(sentMsg.message_id);
     saveStoredMessageIds(activeAttendanceMessageIds);
+    const today = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    await db.saveActiveButtonId(sentMsg.message_id, today).catch(() => {});
 
     console.log('[CRON] 6:00 AM Announcement sent with buttons. Message ID:', sentMsg.message_id);
   } catch (err) {
@@ -395,19 +419,34 @@ cron.schedule('0 6 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
-// 1.5. Cron Job: 11:30 AM Attendance Closed - Auto-Delete Buttons
+// 🗑️ Cleanup Function: Delete all active buttons (MongoDB Cloud + Local)
 // -------------------------------------------------------------
-cron.schedule('30 11 * * *', async () => {
+async function cleanupOldButtons() {
   try {
-    console.log('[CRON] 11:30 AM: Removing active attendance button messages...');
-    const idsToDelete = [...new Set([...activeAttendanceMessageIds, ...getStoredMessageIds()])];
-    
-    for (const msgId of idsToDelete) {
+    const mongoIds = await db.getActiveButtonIds().catch(() => []);
+    const localIds = [...new Set([...activeAttendanceMessageIds, ...getStoredMessageIds()])];
+    const allIds = [...new Set([...mongoIds, ...localIds])];
+
+    for (const msgId of allIds) {
       await bot.telegram.deleteMessage(GROUP_CHAT_ID, msgId).catch(() => {});
     }
 
     activeAttendanceMessageIds = [];
     saveStoredMessageIds([]);
+    await db.clearActiveButtonIds().catch(() => {});
+    console.log(`[CLEANUP] Deleted ${allIds.length} active button messages from group.`);
+  } catch (e) {
+    console.error('[CLEANUP ERROR]:', e);
+  }
+}
+
+// -------------------------------------------------------------
+// 1.5. Cron Job: 11:30 AM Attendance Closed - Auto-Delete Buttons
+// -------------------------------------------------------------
+cron.schedule('30 11 * * *', async () => {
+  try {
+    console.log('[CRON] 11:30 AM: Removing active attendance button messages...');
+    await cleanupOldButtons();
 
     // Agar Holiday hai, Attendance OFF hai, ya Server Down hai, toh "Closed" message group me NAHI jayega
     if (isHolidayToday() || !getAttendanceState() || getMaintenanceState()) {
@@ -836,6 +875,84 @@ async function getDefaultersList() {
 }
 
 // -------------------------------------------------------------
+// 🚫 Auto-Ban: 5 Din Lagatar Bina Leave ke Absent = Auto Ban from Group
+// -------------------------------------------------------------
+async function checkAndAutoBanMembers() {
+  if (!getAutoBanState()) {
+    console.log('[AUTO-BAN] Auto-Ban feature is OFF, skipping.');
+    return;
+  }
+
+  try {
+    const members = await db.getAllMembers();
+    const attendance = await db.getAllAttendance();
+
+    // Unique recorded working dates sorted descending (newest first)
+    const uniqueDates = [...new Set(attendance.map(r => String(r.date).trim()))].filter(Boolean);
+    uniqueDates.sort((a, b) => {
+      const dtA = DateTime.fromFormat(a, 'dd-MM-yyyy');
+      const dtB = DateTime.fromFormat(b, 'dd-MM-yyyy');
+      return dtB.toMillis() - dtA.toMillis();
+    });
+
+    if (uniqueDates.length === 0) return;
+
+    for (const member of members) {
+      const uId = String(member.userId);
+      // 👑 Super Admin ko kabhi ban nahi karenge
+      if (uId === String(ADMIN_ID)) continue;
+
+      const memberRecords = attendance.filter(r => String(r.userId) === uId);
+
+      let consecutiveAbsent = 0;
+      for (const dStr of uniqueDates) {
+        const rec = memberRecords.find(r => String(r.date).trim() === dStr);
+        if (rec && (rec.status === 'Present' || rec.status === 'Leave')) {
+          break; // Member attended or took approved leave, stop absent count
+        } else {
+          consecutiveAbsent++;
+        }
+      }
+
+      // 5 Din ya usse zyada lagatar bina Leave ke Absent rehne par Auto-Ban
+      if (consecutiveAbsent >= 5) {
+        try {
+          // 1. Telegram Group se Ban karein
+          await bot.telegram.banChatMember(GROUP_CHAT_ID, uId);
+          // 2. Database se remove karein
+          await db.removeMember(uId);
+
+          const uText = member.username ? ' (@' + escapeHTML(member.username) + ')' : '';
+          const memberName = escapeHTML(member.name || 'Member');
+
+          const banNotice = 
+'╭───────────────✦───────────────╮\n' +
+'│ ⛔ <b>ᴀᴜᴛᴏ-ʙᴀɴ ɴᴏᴛɪᴄᴇ</b> ⛔\n' +
+'╰───────────────✦───────────────╯\n' +
+'👤 <b>Member:</b> <code>' + memberName + '</code>' + uText + '\n' +
+'❌ <b>Reason:</b> Lagatar <b>' + consecutiveAbsent + ' Din</b> se bina Leave ke Absent\n' +
+'⚠️ <i>Is member ko group se permanently ban kar diya gaya hai.</i>\n' +
+'━━━━━━━━━━━━━━━━━━━━━━\n' +
+'📌 <i>Dhyan dein: Bina leave liye lagatar 5 din absent rehne par system automatic remove/ban kar deta hai.</i> 🌸';
+
+          await bot.telegram.sendMessage(GROUP_CHAT_ID, banNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+          // Admin Mahi ko DM me private notification bhejein
+          const adminNotice = '⛔ <b>AUTO-BAN EXECUTED:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <code>' + memberName + '</code>' + uText + '\n❌ <b>' + consecutiveAbsent + ' Din</b> se bina leave ke absent tha/thi.\nGroup se remove & ban kar diya gaya hai.';
+          await bot.telegram.sendMessage(ADMIN_ID, adminNotice, { parse_mode: 'HTML' }).catch(() => {});
+
+          console.log('[AUTO-BAN] Banned member: ' + member.name + ' (' + uId + ') - ' + consecutiveAbsent + ' days absent.');
+        } catch (banErr) {
+          console.error('[AUTO-BAN ERROR] Failed to ban ' + uId + ':', banErr.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[AUTO-BAN CHECK ERROR]:', err);
+  }
+}
+
+// -------------------------------------------------------------
 // 2. Cron Job: 9:00 PM Daily Attendance Report Summary
 // -------------------------------------------------------------
 cron.schedule('0 21 * * *', async () => {
@@ -857,6 +974,9 @@ cron.schedule('0 21 * * *', async () => {
   }
 
   await sendDailyAttendanceReport(GROUP_CHAT_ID);
+
+  // 🚫 Auto-Ban check: 5+ din bina leave absent wale members ko ban karein
+  await checkAndAutoBanMembers();
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
@@ -1094,6 +1214,22 @@ bot.action('adm_refresh', async (ctx) => {
   } catch (e) {}
 });
 
+// Auto-Ban Toggle
+bot.action('adm_toggle_autoban', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  const current = getAutoBanState();
+  setAutoBanState(!current);
+  const statusStr = !current
+    ? '🟢 Auto-Ban ON kar diya! Ab 5+ din absent members auto ban honge.'
+    : '🔴 Auto-Ban OFF kar diya! Ab automatic ban nahi hoga.';
+  await ctx.answerCbQuery(statusStr, { show_alert: true });
+
+  try {
+    await ctx.editMessageText(getAdminDashboardText(), { parse_mode: 'HTML', ...getAdminKeyboard() });
+  } catch (e) {}
+});
+
 // 5. Past & Monthly Reports Menu
 bot.action('adm_past_reports', async (ctx) => {
   if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
@@ -1247,6 +1383,37 @@ bot.action('adm_cancel_defaulters', async (ctx) => {
 // -------------------------------------------------------------
 // 👑 ADMIN DIRECT TEXT COMMANDS (Only for Admin)
 // -------------------------------------------------------------
+bot.hears(/^\/(deletebuttons|cleanbuttons)(@\w+)?$/i, async (ctx) => {
+  if (!checkIsAdmin(ctx)) return;
+  await ctx.reply('⏳ Deleting all active attendance button messages from group...');
+  await cleanupOldButtons();
+  await ctx.reply('✅ <b>Saare active buttons group se delete kar diye gaye hain!</b>', { parse_mode: 'HTML' });
+});
+
+bot.hears(/^\/autoban(@\w+)?( .*)?$/i, async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!checkIsAdmin(ctx)) return;
+
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+  if (args === 'on') {
+    setAutoBanState(true);
+    return ctx.reply('🟢 <b>Auto-Ban is now turned ON!</b>\n5+ din lagatar bina leave absent rehne wale members auto-ban honge.', { parse_mode: 'HTML' });
+  } else if (args === 'off') {
+    setAutoBanState(false);
+    return ctx.reply('🔴 <b>Auto-Ban is now turned OFF!</b>\nKoi bhi member automatically ban nahi hoga.', { parse_mode: 'HTML' });
+  } else if (args === 'check' || args === 'run') {
+    await ctx.reply('⏳ Checking & scanning members for 5+ days absent...');
+    await checkAndAutoBanMembers();
+    return ctx.reply('✅ <b>Auto-Ban Scan Complete!</b>', { parse_mode: 'HTML' });
+  } else {
+    const state = getAutoBanState() ? '🟢 ON' : '🔴 OFF';
+    return ctx.reply(
+      '🚫 <b>AUTO-BAN SETTINGS:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n• Current Status: <b>' + state + '</b>\n• Rule: <b>5 Din</b> lagatar bina leave ke absent = Auto-Ban from Group\n\n<b>Commands:</b>\n• <code>/autoban on</code> - Turn ON\n• <code>/autoban off</code> - Turn OFF\n• <code>/autoban check</code> - Run check now',
+      { parse_mode: 'HTML' }
+    );
+  }
+});
+
 bot.hears(/^\/attendanceon(@\w+)?$/i, async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   if (!checkIsAdmin(ctx)) return;
@@ -1520,6 +1687,7 @@ bot.hears(/^\/(attendance|panel|menu)(@\w+)?$/i, async (ctx) => {
     
     activeAttendanceMessageIds.push(panelMsg.message_id);
     saveStoredMessageIds(activeAttendanceMessageIds);
+    await db.saveActiveButtonId(panelMsg.message_id, nowKolkata.toFormat('dd-MM-yyyy')).catch(() => {});
 
     if (ctx.message && ctx.message.message_id) {
       setTimeout(() => {
