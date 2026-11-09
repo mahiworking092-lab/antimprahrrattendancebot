@@ -29,6 +29,13 @@ attendanceSchema.index({ userId: 1, date: 1 }, { unique: true });
 const Member = mongoose.model('Member', memberSchema);
 const Attendance = mongoose.model('Attendance', attendanceSchema);
 
+// 🗄️ MongoDB Schema for Active Buttons (11:30 AM Auto-Delete ke liye)
+const buttonStoreSchema = new mongoose.Schema({
+  date: { type: String, required: true },
+  messageId: { type: Number, required: true }
+});
+const ButtonStore = mongoose.model('ButtonStore', buttonStoreSchema);
+
 let isMongoConnected = false;
 
 if (MONGODB_URI && MONGODB_URI.trim() !== '') {
@@ -271,7 +278,43 @@ async function generateMonthlyCSVFilePath(monthYear) {
   return { filePath: exportPath, totalDays, memberCount: allMembers.length, monthRecordsCount: monthRecords.length };
 }
 
+// 🗄️ Naye Functions: MongoDB Button Storage & Auto-Delete Helpers
+async function saveActiveButtonId(messageId, date) {
+  try {
+    if (isMongoConnected) {
+      await ButtonStore.create({ date, messageId });
+    }
+  } catch (e) {
+    console.error('[DB] saveActiveButtonId error:', e.message);
+  }
+}
+
+async function getActiveButtonIds() {
+  try {
+    if (isMongoConnected) {
+      const records = await ButtonStore.find();
+      return records.map(r => r.messageId);
+    }
+  } catch (e) {
+    console.error('[DB] getActiveButtonIds error:', e.message);
+  }
+  return [];
+}
+
+async function clearActiveButtonIds() {
+  try {
+    if (isMongoConnected) {
+      await ButtonStore.deleteMany({});
+    }
+  } catch (e) {
+    console.error('[DB] clearActiveButtonIds error:', e.message);
+  }
+}
+
 module.exports = {
+  saveActiveButtonId,
+  getActiveButtonIds,
+  clearActiveButtonIds,
   registerMember,
   removeMember,
   getAllMembers,
