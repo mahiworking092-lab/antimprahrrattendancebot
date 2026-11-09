@@ -192,6 +192,7 @@ function getAdminKeyboard() {
       Markup.button.callback('🗓️ Past & Month Reports', 'adm_past_reports')
     ],
     [
+      Markup.button.callback('🚨 Defaulters List (Inactive)', 'adm_defaulters_list'),
       Markup.button.callback('🔄 Refresh Status', 'adm_refresh')
     ]
   ]);
@@ -431,6 +432,71 @@ cron.schedule('30 11 * * *', async () => {
 }, { timezone: 'Asia/Kolkata' });
 
 // -------------------------------------------------------------
+// Helper: Working-Day Smart Streak Calculator & Badge
+// -------------------------------------------------------------
+function getStreakBadge(streakCount) {
+  if (streakCount >= 30) return ' 👑 [Legend]';
+  if (streakCount >= 15) return ' 🌟 [Gold]';
+  if (streakCount >= 7) return ' 🔥 [Silver]';
+  if (streakCount >= 3) return ' ⚡ [Rising Star]';
+  return '';
+}
+
+function calculateWorkingDayStreak(userId, allRows, targetDateStr = null, isUserPresentToday = null) {
+  const uId = String(userId);
+  const targetDt = targetDateStr
+    ? DateTime.fromFormat(targetDateStr, 'dd-MM-yyyy', { zone: 'Asia/Kolkata' })
+    : DateTime.now().setZone('Asia/Kolkata');
+
+  const dateMap = new Map();
+  const userRecords = new Map();
+
+  for (const r of allRows) {
+    const dStr = String(r.date || '').trim();
+    if (!dStr) continue;
+    const dt = DateTime.fromFormat(dStr, 'dd-MM-yyyy', { zone: 'Asia/Kolkata' });
+    if (dt.isValid && dt.startOf('day') <= targetDt.startOf('day')) {
+      dateMap.set(dStr, dt.toMillis());
+    }
+    if (String(r.userId) === uId) {
+      userRecords.set(dStr, String(r.status || 'Present').trim());
+    }
+  }
+
+  if (targetDateStr && isUserPresentToday === true) {
+    dateMap.set(targetDateStr, targetDt.toMillis());
+    userRecords.set(targetDateStr, 'Present');
+  }
+
+  // Sort dates descending (newest to oldest)
+  const sortedDates = Array.from(dateMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(entry => entry[0]);
+
+  if (sortedDates.length === 0) return 0;
+
+  let streak = 0;
+  let startIdx = 0;
+
+  if (targetDateStr && sortedDates[0] === targetDateStr) {
+    if (userRecords.get(targetDateStr) !== 'Present') {
+      startIdx = 1;
+    }
+  }
+
+  for (let i = startIdx; i < sortedDates.length; i++) {
+    const dStr = sortedDates[i];
+    if (userRecords.get(dStr) === 'Present') {
+      streak++;
+    } else {
+      break;
+    }
+  }
+
+  return streak;
+}
+
+// -------------------------------------------------------------
 // Function: Generate & Send Attractive Single-Card Night Report
 // -------------------------------------------------------------
 async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
@@ -496,23 +562,11 @@ async function sendDailyAttendanceReport(targetChatId = GROUP_CHAT_ID) {
     const emptyBlocks = 10 - filledBlocks;
     const progressBar = '▰'.repeat(filledBlocks) + '▱'.repeat(emptyBlocks);
 
-    // Streaks for Present Members
+    // Streaks for Present Members (Smart Working-Days Calculation)
     const streakList = [];
     for (const pUser of presentUsers) {
       const uId = String(pUser.userId);
-      const uRows = attendance.filter(r => String(r.userId) === uId);
-      let sCount = 1;
-      let checkDate = nowKolkata.minus({ days: 1 });
-      while (true) {
-        const dStr = checkDate.toFormat('dd-MM-yyyy');
-        const pRec = uRows.find(r => String(r.date).trim() === dStr);
-        if (pRec && String(pRec.status || 'Present').trim() === 'Present') {
-          sCount++;
-          checkDate = checkDate.minus({ days: 1 });
-        } else {
-          break;
-        }
-      }
+      const sCount = calculateWorkingDayStreak(uId, attendance, today, true);
       streakList.push({ name: escapeHTML(pUser.name || 'Unknown'), streak: sCount });
     }
     streakList.sort((a, b) => b.streak - a.streak);
@@ -731,6 +785,53 @@ ${topList}
   } catch (err) {
     console.error('[MONTHLY_SUMMARY ERROR]:', err);
     return '⚠️ Error generating monthly summary.';
+  }
+}
+
+async function getDefaultersList() {
+  try {
+    const members = await db.getAllMembers();
+    const attendance = await db.getAllAttendance();
+
+    // Unique dates recorded, sorted descending
+    const uniqueDates = [...new Set(attendance.map(r => String(r.date).trim()))].filter(Boolean);
+    uniqueDates.sort((a, b) => {
+      const dtA = DateTime.fromFormat(a, 'dd-MM-yyyy');
+      const dtB = DateTime.fromFormat(b, 'dd-MM-yyyy');
+      return dtB.toMillis() - dtA.toMillis();
+    });
+
+    const defaulters = [];
+
+    for (const member of members) {
+      const uId = String(member.userId);
+      const memberRecords = attendance.filter(r => String(r.userId) === uId);
+
+      let consecutiveAbsent = 0;
+      for (const dStr of uniqueDates) {
+        const rec = memberRecords.find(r => String(r.date).trim() === dStr);
+        if (rec && (rec.status === 'Present' || rec.status === 'Leave')) {
+          break; // Member attended or took leave, break streak
+        } else {
+          consecutiveAbsent++;
+        }
+      }
+
+      if (consecutiveAbsent >= 3) {
+        defaulters.push({
+          userId: uId,
+          name: member.name || 'Unknown',
+          username: member.username ? `@${member.username}` : '',
+          days: consecutiveAbsent
+        });
+      }
+    }
+
+    defaulters.sort((a, b) => b.days - a.days);
+    return defaulters;
+  } catch (err) {
+    console.error('[DEFAULTERS ERROR]:', err);
+    return [];
   }
 }
 
@@ -1069,6 +1170,80 @@ bot.action('adm_cancel_date_prompt', async (ctx) => {
   } catch (e) {}
 });
 
+// 6. Defaulters List Actions
+bot.action('adm_defaulters_list', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('🔍 Defaulters check ho rahe hain...');
+  const defaulters = await getDefaultersList();
+
+  if (defaulters.length === 0) {
+    return ctx.reply('✅ <b>Koi Defaulter Nahi Hai!</b>\n━━━━━━━━━━━━━━━━━━━━━━\nGroup ke sabhi members active hain ya lagatar 3 din se koi absent nahi hai. 🌸', { parse_mode: 'HTML' });
+  }
+
+  let listText = defaulters.map((d, idx) => {
+    const uText = d.username ? ` (${escapeHTML(d.username)})` : '';
+    return `${idx + 1}. ⚠️ <code>${escapeHTML(d.name)}</code>${uText} ➔ <b>${d.days} Din se Absent</b>`;
+  }).join('\n');
+
+  const text = `🚨 <b>DEFAULTERS LIST (LAGATAR ABSENT)</b>\n━━━━━━━━━━━━━━━━━━━━━━\n⚠️ <i>Niche diye gaye members lagatar 3 ya usse jyada dino se bina leave ke Absent hain:</i>\n\n${listText}\n\n👥 <b>Total Defaulters:</b> <code>${defaulters.length} Members</code>\n━━━━━━━━━━━━━━━━━━━━━━\n❓ <i>Kya aap Group me in sabhi ko official Warning Card bhejna chahte hain?</i>`;
+
+  const warningChoiceKb = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('📢 Group me Warning Card Bhejein', 'adm_send_defaulters_warning')
+    ],
+    [
+      Markup.button.callback('❌ Cancel', 'adm_cancel_defaulters')
+    ]
+  ]);
+
+  await ctx.reply(text, { parse_mode: 'HTML', ...warningChoiceKb });
+});
+
+bot.action('adm_send_defaulters_warning', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery('⛔ Not authorized.', { show_alert: true });
+
+  await ctx.answerCbQuery('📢 Group me warning notice bhej rahe hain...');
+  const defaulters = await getDefaultersList();
+
+  if (defaulters.length === 0) {
+    return ctx.reply('Abhi koi defaulter nahi mila.');
+  }
+
+  let listText = defaulters.map(d => {
+    const uText = d.username ? ` (${escapeHTML(d.username)})` : '';
+    return `• ⚠️ <b>${escapeHTML(d.name)}</b>${uText} ➔ <code>${d.days} Din se Inactive!</code>`;
+  }).join('\n');
+
+  const warningCard = 
+`╭───────────────✦───────────────╮
+│ ⚠️ <b>OFFICIAL ATTENDANCE WARNING</b> ⚠️
+╰───────────────✦───────────────╯
+📢 <b>Dhyan dein sabhi members!</b>
+Niche diye gaye members lagatar <b>3 ya usse jyada dino se</b> bina kisi leave ya reason ke Absent hain:
+
+${listText}
+
+━━━━━━━━━━━━━━━━━━━━━━
+📌 <b>Strict Warning:</b>
+Lagatar bina bataye absent rehne se aapki attendance rate gir rahi hai.
+Kripya daily <b>06:00 AM – 11:30 AM</b> ke beech apni attendance zaroor lagayein, ya agar koi samasya hai toh <b>Take Leave</b> karein! 🌸`;
+
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {}
+
+  await bot.telegram.sendMessage(GROUP_CHAT_ID, warningCard, { parse_mode: 'HTML' }).catch(() => {});
+  await ctx.reply('✅ <b>Warning Card Group me successfully post kar diya gaya hai!</b>', { parse_mode: 'HTML' });
+});
+
+bot.action('adm_cancel_defaulters', async (ctx) => {
+  if (!checkIsAdmin(ctx)) return ctx.answerCbQuery();
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {}
+});
+
 // -------------------------------------------------------------
 // 👑 ADMIN DIRECT TEXT COMMANDS (Only for Admin)
 // -------------------------------------------------------------
@@ -1259,6 +1434,23 @@ bot.hears(/^\/monthcsv(@\w+)?$/i, async (ctx) => {
   }
 });
 
+bot.hears(/^\/(defaulters|inactive)(@\w+)?$/i, async (ctx) => {
+  if (!checkIsAdmin(ctx)) return;
+  const defaulters = await getDefaultersList();
+
+  if (defaulters.length === 0) {
+    return ctx.reply('✅ <b>Koi Defaulter Nahi Hai!</b>\n━━━━━━━━━━━━━━━━━━━━━━\nGroup ke sabhi members active hain ya 3 din se lagatar koi absent nahi hai. 🌸', { parse_mode: 'HTML' });
+  }
+
+  let listText = defaulters.map((d, idx) => {
+    const uText = d.username ? ` (${escapeHTML(d.username)})` : '';
+    return `${idx + 1}. ⚠️ <code>${escapeHTML(d.name)}</code>${uText} ➔ <b>${d.days} Din se Absent</b>`;
+  }).join('\n');
+
+  const text = `🚨 <b>DEFAULTERS LIST (LAGATAR ABSENT)</b>\n━━━━━━━━━━━━━━━━━━━━━━\n${listText}\n\n👥 <b>Total Defaulters:</b> <code>${defaulters.length} Members</code>`;
+  await ctx.reply(text, { parse_mode: 'HTML' });
+});
+
 // -------------------------------------------------------------
 // 3. Command: /admission form
 // -------------------------------------------------------------
@@ -1287,24 +1479,9 @@ bot.hears(/^\/mystatus(@\w+)?$/, async (ctx) => {
     const totalLogs = userRows.length;
     const attendanceRate = totalLogs > 0 ? Math.round((presentCount / totalLogs) * 100) : 0;
 
-    let streakCount = 0;
-    let checkDate = DateTime.now().setZone('Asia/Kolkata');
-    while (true) {
-      const dateStr = checkDate.toFormat('dd-MM-yyyy');
-      const pastRecord = userRows.find(r => String(r.date).trim() === dateStr);
-      if (pastRecord && String(pastRecord.status || 'Present').trim() === 'Present') {
-        streakCount++;
-        checkDate = checkDate.minus({ days: 1 });
-      } else {
-        break;
-      }
-    }
-
-    let badge = '';
-    if (streakCount >= 30) badge = ' 👑 [Legend]';
-    else if (streakCount >= 15) badge = ' 🌟 [Gold]';
-    else if (streakCount >= 7) badge = ' 🔥 [Silver]';
-    else if (streakCount >= 3) badge = ' ⚡ [Rising Star]';
+    const todayStr = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    const streakCount = calculateWorkingDayStreak(userId, allRows, todayStr);
+    const badge = getStreakBadge(streakCount);
 
     const text = `<b>📊 ATTENDANCE SUMMARY: ${name}</b>\n━━━━━━━━━━━━━━━━━━━━━━\n📅 <b>Total Logs:</b> <code>${totalLogs}</code>\n✅ <b>Present Days:</b> <code>${presentCount}</code>\n🍂 <b>Leave Days:</b> <code>${leaveCount}</code>\n📈 <b>Attendance Rate:</b> <code>${attendanceRate}%</code>\n🔥 <b>Current Streak:</b> <code>${streakCount} Days${badge}</code>`;
 
@@ -1399,27 +1576,8 @@ bot.action('btn_present', async (ctx) => {
     }
 
     const allRows = await db.getAllAttendance();
-    let streakCount = 1;
-    let checkDate = nowKolkata.minus({ days: 1 });
-    while (true) {
-      const dateStr = checkDate.toFormat('dd-MM-yyyy');
-      const pastRecord = allRows.find(r =>
-        String(r.userId) === userId &&
-        String(r.date).trim() === dateStr
-      );
-      if (pastRecord && String(pastRecord.status || 'Present').trim() === 'Present') {
-        streakCount++;
-        checkDate = checkDate.minus({ days: 1 });
-      } else {
-        break;
-      }
-    }
-
-    let badge = '';
-    if (streakCount >= 30) badge = ' 👑 [Legend]';
-    else if (streakCount >= 15) badge = ' 🌟 [Gold]';
-    else if (streakCount >= 7) badge = ' 🔥 [Silver]';
-    else if (streakCount >= 3) badge = ' ⚡ [Rising Star]';
+    const streakCount = calculateWorkingDayStreak(userId, allRows, today, true);
+    const badge = getStreakBadge(streakCount);
 
     await ctx.answerCbQuery(`✅ Attendance Marked!\n🔥 ${streakCount}-Day Streak!${badge}`, { show_alert: true });
 
@@ -1562,24 +1720,9 @@ bot.action('btn_mystatus', async (ctx) => {
     const totalLogs = userRows.length;
     const attendanceRate = totalLogs > 0 ? Math.round((presentCount / totalLogs) * 100) : 0;
 
-    let streakCount = 0;
-    let checkDate = DateTime.now().setZone('Asia/Kolkata');
-    while (true) {
-      const dateStr = checkDate.toFormat('dd-MM-yyyy');
-      const pastRecord = userRows.find(r => String(r.date).trim() === dateStr);
-      if (pastRecord && String(pastRecord.status || 'Present').trim() === 'Present') {
-        streakCount++;
-        checkDate = checkDate.minus({ days: 1 });
-      } else {
-        break;
-      }
-    }
-
-    let badge = '';
-    if (streakCount >= 30) badge = ' 👑 [Legend]';
-    else if (streakCount >= 15) badge = ' 🌟 [Gold]';
-    else if (streakCount >= 7) badge = ' 🔥 [Silver]';
-    else if (streakCount >= 3) badge = ' ⚡ [Rising Star]';
+    const todayStr = DateTime.now().setZone('Asia/Kolkata').toFormat('dd-MM-yyyy');
+    const streakCount = calculateWorkingDayStreak(userId, allRows, todayStr);
+    const badge = getStreakBadge(streakCount);
 
     const alertText = `📊 Status for ${name}:\n✅ Present: ${presentCount} | 🍂 Leave: ${leaveCount}\n📈 Rate: ${attendanceRate}%\n🔥 Streak: ${streakCount} Days${badge}`;
     await ctx.answerCbQuery(alertText, { show_alert: true });
@@ -1672,30 +1815,12 @@ bot.hears(/^(\/present|\/leave)(@\w+)?( .*)?$/i, async (ctx) => {
     }
 
     let streakCount = 0;
+    let badge = '';
     if (isPresent) {
       const allRows = await db.getAllAttendance();
-      streakCount = 1;
-      let checkDate = nowKolkata.minus({ days: 1 });
-      while (true) {
-        const dateStr = checkDate.toFormat('dd-MM-yyyy');
-        const pastRecord = allRows.find(r =>
-          String(r.userId) === userId &&
-          String(r.date).trim() === dateStr
-        );
-        if (pastRecord && String(pastRecord.status || 'Present').trim() === 'Present') {
-          streakCount++;
-          checkDate = checkDate.minus({ days: 1 });
-        } else {
-          break;
-        }
-      }
+      streakCount = calculateWorkingDayStreak(userId, allRows, today, true);
+      badge = getStreakBadge(streakCount);
     }
-
-    let badge = '';
-    if (streakCount >= 30) badge = ' 👑 [Legend]';
-    else if (streakCount >= 15) badge = ' 🌟 [Gold]';
-    else if (streakCount >= 7) badge = ' 🔥 [Silver]';
-    else if (streakCount >= 3) badge = ' ⚡ [Rising Star]';
 
     let replyText = isPresent
       ? `<b>✅ ${name}, attendance marked!</b>\n<code>🔥 ${streakCount}-Day Streak!${badge}</code>`
